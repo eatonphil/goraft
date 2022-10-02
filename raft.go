@@ -1,4 +1,4 @@
-package main
+package goraft
 
 import (
 	"encoding/gob"
@@ -75,13 +75,13 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
-type ClusterEntry struct {
+type ClusterMember struct {
 	Id      string
 	Address string
 	// Index of the next log entry to send
-	nextIndex uint64
+	nextIndex *atomic.Uint64
 	// Highest log entry known to be replicated
-	matchIndex uint64
+	matchIndex *atomic.Uint64
 }
 
 type ServerPersistent struct {
@@ -144,20 +144,26 @@ type Server struct {
 	randomElectionTimeout time.Duration
 
 	// Servers in the cluster, not including this one
-	cluster []ClusterEntry
+	cluster []ClusterMember
 
 	// For keeping the electionTimeout reset
 	heartbeat time.Time
 }
 
-func newServer(
+func NewServer(
 	id string,
 	address string,
 	electionTimeout time.Duration,
-	cluster []ClusterEntry,
+	cluster []ClusterMember,
 	statemachine StateMachine,
 	metadataDir string,
 ) *Server {
+	// Initialize atomics
+	for i := range cluster {
+		cluster[i].nextIndex = new(atomic.Uint64)
+		cluster[i].matchIndex = new(atomic.Uint64)
+	}
+
 	return &Server{
 		state:           followerState,
 		id:              id,
@@ -184,12 +190,15 @@ func (s *Server) restore() {
 	s.fd.Seek(0, 0)
 	dec := gob.NewDecoder(s.fd)
 	err := dec.Decode(&s.Persistent)
-	if err != nil && err != io.EOF {
-		panic(err)
+	if err != nil {
+		// Always must be one log entry
+		if err == io.EOF {
+			s.Persistent.Log = []Entry{{}}
+		} else {
+			panic(err)
+		}
 	}
-	if len(s.Persistent.Log) > 0 {
-		s.lastLogIndex = uint64(len(s.Persistent.Log) - 1)
-	}
+	s.lastLogIndex = uint64(len(s.Persistent.Log) - 1)
 }
 
 func (s *Server) termChange(msg RPCMessage) bool {
@@ -208,25 +217,20 @@ func (s *Server) termChange(msg RPCMessage) bool {
 	return false
 }
 
-func (s *Server) leaderAppendEntries(server ClusterEntry, entries []Entry) (*AppendEntriesResponse, error) {
+func (s *Server) leaderAppendEntries(server ClusterMember, entries []Entry) (*AppendEntriesResponse, error) {
 	client, err := rpc.DialHTTP("tcp", server.Address)
 	if err != nil {
 		return nil, fmt.Errorf("Could not connect to %s at %s: %s", server.Id, server.Address, err)
 	}
 
-	var prevLogTerm, prevLogIndex uint64
-	if server.nextIndex > 0 {
-		prevLogTerm = s.Persistent.Log[server.nextIndex-1].Term
-		prevLogIndex = server.nextIndex - 1
-	}
-
+	prevIndex := server.nextIndex.Load() - 1
 	req := AppendEntriesRequest{
 		RPCMessage: RPCMessage{
 			Term: s.Persistent.CurrentTerm,
 		},
 		LeaderId:     s.id,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  s.Persistent.Log[prevIndex].Term,
 		Entries:      entries,
 		LeaderCommit: s.commitIndex,
 	}
@@ -242,24 +246,24 @@ func (s *Server) leaderAppendEntries(server ClusterEntry, entries []Entry) (*App
 }
 
 func (s *Server) leaderSendHeartbeat() {
-	for _, other := range s.cluster {
-		rsp, err := s.leaderAppendEntries(other, nil)
+	for _, member := range s.cluster {
+		rsp, err := s.leaderAppendEntries(member, nil)
 		if err != nil {
 			log.Printf("Heartbeat failed: %s", err)
 			continue
 		}
 
 		if !rsp.Success {
-			log.Printf("Heartbeat from leader %s to server %s failed", s.id, other.Id)
+			log.Printf("Heartbeat from leader %s to server %s failed", s.id, member.Id)
 		}
 	}
 }
 
 func (s *Server) leaderElected() {
 	// Reinitialize volatile leader state after every election
-	for _, others := range s.cluster {
-		others.nextIndex = s.lastLogIndex + 1
-		others.matchIndex = 0
+	for _, member := range s.cluster {
+		member.nextIndex.Store(s.lastLogIndex + 1)
+		member.matchIndex.Store(0)
 	}
 	s.leaderSendHeartbeat()
 }
@@ -292,21 +296,12 @@ func (s *Server) election() {
 	// But Servers always vote for themselves
 	votesNeeded.Add(-1)
 
-	for _, other := range s.cluster {
-		go func(other ClusterEntry) {
-			client, err := rpc.DialHTTP("tcp", other.Address)
+	for _, member := range s.cluster {
+		go func(member ClusterMember) {
+			client, err := rpc.DialHTTP("tcp", member.Address)
 			if err != nil {
-				log.Printf("Could not connect to %s at %s: %s", other.Id, other.Address, err)
+				log.Printf("Could not connect to %s at %s: %s", member.Id, member.Address, err)
 				return
-			}
-
-			// Special case for when there are zero logs so far
-			var lastLogTerm uint64
-			lastLogIndex := s.lastLogIndex
-			if len(s.Persistent.Log) == 0 {
-				lastLogIndex = 0
-			} else {
-				lastLogTerm = s.Persistent.Log[lastLogIndex].Term
 			}
 
 			req := RequestVoteRequest{
@@ -314,23 +309,23 @@ func (s *Server) election() {
 					Term: s.Persistent.CurrentTerm,
 				},
 				CandidateId:  s.id,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
+				LastLogIndex: s.lastLogIndex,
+				LastLogTerm:  s.Persistent.Log[s.lastLogIndex].Term,
 			}
 			var rsp RequestVoteResponse
 			err = client.Call("Server.RequestVote", req, &rsp)
 			if err != nil {
-				log.Printf("RequestVote to %s at %s failed: %s", other.Id, other.Address, err)
+				log.Printf("RequestVote to %s at %s failed: %s", member.Id, member.Address, err)
 				return
 			}
 
 			if rsp.VoteGranted {
-				log.Printf("Server %s voted for %s for term %d", other.Id, s.id, s.Persistent.CurrentTerm)
+				log.Printf("Server %s voted for %s for term %d", member.Id, s.id, s.Persistent.CurrentTerm)
 				votesNeeded.Add(-1)
 			}
 
 			s.termChange(rsp.RPCMessage)
-		}(other)
+		}(member)
 	}
 
 	// Instantiate this here outside so it doesn't get reset each loop
@@ -412,15 +407,14 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 
 	// 1. Reply false if term < Persistent.CurrentTerm (§5.1)
 	if req.Term < s.Persistent.CurrentTerm {
-		log.Printf("Candidate %s not finding a leader in %s: %d < %d", s.id, req.LeaderId, req.Term, s.Persistent.CurrentTerm)
+		log.Printf("Server %s not finding a leader in %s: %d < %d", s.id, req.LeaderId, req.Term, s.Persistent.CurrentTerm)
 		return nil
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
-	if !(req.PrevLogIndex == 0 && s.lastLogIndex == 0 && req.PrevLogTerm == 0) && (req.PrevLogIndex >= s.lastLogIndex ||
-		s.Persistent.Log[req.PrevLogIndex].Term != req.PrevLogTerm) {
-		log.Printf("Candidate %s not finding an up-to-date leader in %s", s.id, req.LeaderId)
+	if s.Persistent.Log[req.PrevLogIndex].Term != req.PrevLogTerm {
+		log.Printf("Server %s not finding an up-to-date leader in %s", s.id, req.LeaderId)
 		return nil
 	}
 
@@ -437,7 +431,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 
 		// 4. Append any new entries not already in the log
 		s.Persistent.Log = append(s.Persistent.Log, entry)
-		s.lastLogIndex++
+		s.lastLogIndex = uint64(len(s.Persistent.Log) - 1)
 	}
 	s.persist()
 
@@ -445,6 +439,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 	// min(leaderCommit, index of last new entry)
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, s.lastLogIndex)
+		log.Printf("Updating server %s to latest commit: %d", s.id, s.commitIndex)
 	}
 
 	rsp.Success = true
@@ -452,6 +447,35 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 	log.Printf("Server %s successfully received %d entries from leader %s", s.id, len(req.Entries), req.LeaderId)
 
 	return nil
+}
+
+func (s *Server) leaderApplyToFollower(follower ClusterMember) {
+	nextIndex := follower.nextIndex.Load()
+	for {
+		if s.lastLogIndex >= nextIndex {
+			log.Println("How many to update", nextIndex, len(s.Persistent.Log[nextIndex:]))
+			rsp, err := s.leaderAppendEntries(follower, s.Persistent.Log[nextIndex:])
+			if err != nil {
+				log.Printf("Could not connect to %s at %s: %s", follower.Id, follower.Address, err)
+				// Need to retry
+				continue
+			}
+
+			if rsp.Success {
+				follower.nextIndex.Store(s.lastLogIndex + 1)
+				follower.matchIndex.Store(s.lastLogIndex)
+
+				log.Printf("Node %s committed", follower.Id)
+				return
+			} else {
+				// At the end, just need to keep retrying
+				if nextIndex > 1 {
+					nextIndex--
+				}
+				// No break, retry the request
+			}
+		}
+	}
 }
 
 func (s *Server) Apply(command []byte) ([]byte, error) {
@@ -472,48 +496,37 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	var majorityCounter atomic.Int32
 	majorityCounter.Store(int32(majorityNeeded))
 
-	for _, other := range s.cluster {
-		go func(other ClusterEntry) {
-			if s.lastLogIndex >= other.nextIndex {
-				rsp, err := s.leaderAppendEntries(other, s.Persistent.Log[other.nextIndex:])
-				if err != nil {
-					log.Printf("Could not connect to %s at %s: %s", other.Id, other.Address, err)
-					return
-				}
-
-				if rsp.Success {
-					other.nextIndex = s.lastLogIndex + 1
-					other.matchIndex = s.lastLogIndex
-
-					log.Printf("Node %s committed", other.Id)
-					majorityCounter.Add(-1)
-					return
-				} else {
-					other.nextIndex--
-					// No break, retry the request
-				}
-			}
-		}(other)
+	for _, member := range s.cluster {
+		go func(member ClusterMember) {
+			s.leaderApplyToFollower(member)
+			majorityCounter.Add(-1)
+		}(member)
 	}
 
 	// Wait for a majority to commit
+	lastDebug := time.Now()
 	for majorityCounter.Load() > 0 {
-		log.Println("Waiting for majority to commit")
+		if lastDebug.Add(time.Second).Before(time.Now()) {
+			lastDebug = time.Now()
+			log.Println("Waiting for majority to commit")
+		}
 	}
 
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == Persistent.CurrentTerm:
 	// set commitIndex = N (§5.3, §5.4).
 	var minMatchIndex = ^uint64(0) /* max */
-	for _, other := range s.cluster {
-		if other.matchIndex >= s.commitIndex &&
-			s.Persistent.Log[other.matchIndex].Term == s.Persistent.CurrentTerm &&
-			other.matchIndex < minMatchIndex {
-			minMatchIndex = other.matchIndex
+	for _, member := range s.cluster {
+		matchIndex := member.matchIndex.Load()
+		if matchIndex >= s.commitIndex &&
+			s.Persistent.Log[matchIndex].Term == s.Persistent.CurrentTerm &&
+			matchIndex < minMatchIndex {
+			minMatchIndex = matchIndex
 			majorityNeeded--
 		}
 	}
 	if majorityNeeded == 0 {
+		log.Printf("Leader has new commit index: %d", minMatchIndex)
 		s.commitIndex = minMatchIndex
 	}
 
@@ -523,7 +536,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	return rsp, err
 }
 
-func (s *Server) start() {
+func (s *Server) Start() {
 	rand.Seed(time.Now().UnixNano())
 	var err error
 	s.fd, err = os.OpenFile(path.Join(s.metadataDir, s.id), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
@@ -543,7 +556,11 @@ func (s *Server) start() {
 	lastLeaderHeartbeat := time.Now()
 	for {
 		if s.commitIndex > s.lastApplied {
-			s.statemachine.Apply(s.Persistent.Log[s.lastApplied].Command)
+			// lastApplied + 1 since first real entry is at 1, not 0
+			_, err := s.statemachine.Apply(s.Persistent.Log[s.lastApplied+1].Command)
+			if err != nil {
+				panic(err)
+			}
 			s.lastApplied++
 		}
 
