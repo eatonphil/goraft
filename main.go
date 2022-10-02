@@ -103,6 +103,6 @@ func main() {
 
 	var sm statemachine
 
-	s := newServer(cfg.id, cfg.address, time.Millisecond*50, cfg.cluster, &sm, "metadata")
+	s := newServer(cfg.id, cfg.address, time.Second*2, cfg.cluster, &sm, "metadata")
 	s.start()
 }

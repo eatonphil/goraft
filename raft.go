@@ -94,12 +94,12 @@ type ServerPersistent struct {
 	Log []Entry
 }
 
-type ServerState uint
+type ServerState string
 
 const (
-	leaderState ServerState = iota
-	followerState
-	candidateState
+	leaderState    ServerState = "leader"
+	followerState              = "follower"
+	candidateState             = "candidate"
 )
 
 type Server struct {
@@ -166,6 +166,7 @@ func newServer(
 		cluster:         cluster,
 		statemachine:    statemachine,
 		metadataDir:     metadataDir,
+		heartbeat:       time.Now(),
 	}
 }
 
@@ -193,6 +194,11 @@ func (s *Server) restore() {
 
 func (s *Server) termChange(msg RPCMessage) bool {
 	if msg.Term > s.Persistent.CurrentTerm {
+		if s.state == followerState {
+			log.Printf("Server %s is now a follower", s.id)
+		} else {
+			log.Printf("Server %s changed from %s to follower", s.id, s.state)
+		}
 		s.state = followerState
 		s.Persistent.CurrentTerm = msg.Term
 		s.persist()
@@ -202,48 +208,79 @@ func (s *Server) termChange(msg RPCMessage) bool {
 	return false
 }
 
-func (s *Server) sendHeartbeat() {
+func (s *Server) leaderAppendEntries(server ClusterEntry, entries []Entry) (*AppendEntriesResponse, error) {
+	client, err := rpc.DialHTTP("tcp", server.Address)
+	if err != nil {
+		return nil, fmt.Errorf("Could not connect to %s at %s: %s", server.Id, server.Address, err)
+	}
+
+	var prevLogTerm, prevLogIndex uint64
+	if server.nextIndex > 0 {
+		prevLogTerm = s.Persistent.Log[server.nextIndex-1].Term
+		prevLogIndex = server.nextIndex - 1
+	}
+
+	req := AppendEntriesRequest{
+		RPCMessage: RPCMessage{
+			Term: s.Persistent.CurrentTerm,
+		},
+		LeaderId:     s.id,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: s.commitIndex,
+	}
+	var rsp AppendEntriesResponse
+	err = client.Call("Server.AppendEntries", &req, &rsp)
+	if err != nil {
+		return nil, fmt.Errorf("AppendEntries to %s at %s failed: %s", server.Id, server.Address, err)
+	}
+
+	s.termChange(rsp.RPCMessage)
+
+	return &rsp, nil
+}
+
+func (s *Server) leaderSendHeartbeat() {
 	for _, other := range s.cluster {
-		client, err := rpc.DialHTTP("tcp", other.Address)
+		rsp, err := s.leaderAppendEntries(other, nil)
 		if err != nil {
-			log.Printf("Could not connect to %s at %s: %s", other.Id, other.Address, err)
-			return
+			log.Printf("Heartbeat failed: %s", err)
+			continue
 		}
 
-		var req AppendEntriesRequest
-		var rsp AppendEntriesResponse
-		err = client.Call("Server.AppendEntries", &req, &rsp)
-		if err != nil {
-			log.Printf("AppendEntries to %s at %s failed: %s", other.Id, other.Address, err)
-			return
+		if !rsp.Success {
+			log.Printf("Heartbeat from leader %s to server %s failed", s.id, other.Id)
 		}
-
-		s.termChange(rsp.RPCMessage)
 	}
 }
 
-func (s *Server) elected() {
-	log.Printf("%s is elected leader for term %d", s.id, s.Persistent.CurrentTerm)
-	s.state = leaderState
+func (s *Server) leaderElected() {
 	// Reinitialize volatile leader state after every election
 	for _, others := range s.cluster {
 		others.nextIndex = s.lastLogIndex + 1
 		others.matchIndex = 0
 	}
-	s.sendHeartbeat()
+	s.leaderSendHeartbeat()
 }
 
 func (s *Server) election() {
+	// New term and reset to candidate
+	s.Persistent.CurrentTerm++
+	s.persist()
+	s.state = candidateState
+
 	// Wait for last election timeout to finish if necessary
 	if s.randomElectionTimeout != 0 {
 		<-time.After(s.randomElectionTimeout)
 	}
 
-	// New term and reset to candidate
-	s.Persistent.CurrentTerm++
-	s.state = candidateState
+	// If it is not still a candidate (election succeeded), don't keep running the election
+	if s.state != candidateState {
+		return
+	}
 
-	log.Printf("%s is starting election for term %d", s.id, s.Persistent.CurrentTerm)
+	log.Printf("Server %s is starting election for term %d", s.id, s.Persistent.CurrentTerm)
 
 	// Random timeout within 150-300ms
 	s.randomElectionTimeout = time.Millisecond * time.Duration(rand.Intn(150)+150)
@@ -263,6 +300,7 @@ func (s *Server) election() {
 				return
 			}
 
+			// Special case for when there are zero logs so far
 			var lastLogTerm uint64
 			lastLogIndex := s.lastLogIndex
 			if len(s.Persistent.Log) == 0 {
@@ -287,6 +325,7 @@ func (s *Server) election() {
 			}
 
 			if rsp.VoteGranted {
+				log.Printf("Server %s voted for %s for term %d", other.Id, s.id, s.Persistent.CurrentTerm)
 				votesNeeded.Add(-1)
 			}
 
@@ -302,15 +341,24 @@ outer:
 		case <-timeout:
 			break outer
 		default:
-			if votesNeeded.Load() == 0 && s.state == candidateState {
-				s.elected()
+			if votesNeeded.Load() <= 0 && s.state == candidateState {
+				// Voted for self
+				s.Persistent.VotedFor.Put(s.id)
+				s.persist()
+
+				log.Printf("Server %s is elected leader for term %d", s.id, s.Persistent.CurrentTerm)
+				s.state = leaderState
+				s.leaderElected()
 				return
 			}
 		}
 	}
 
-	// Election failed due to timeout, start a new one
-	s.election()
+	if s.state == candidateState {
+		// Election failed due to timeout, start a new one
+		log.Printf("Server %s is still a candidate but election timed out", s.id)
+		s.election()
+	}
 }
 
 func (s *Server) RequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) error {
@@ -332,6 +380,7 @@ func (s *Server) RequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) 
 			(req.LastLogTerm == s.Persistent.CurrentTerm && req.LastLogIndex > s.lastLogIndex)) {
 		rsp.VoteGranted = true
 		s.Persistent.VotedFor.Put(req.CandidateId)
+		s.persist()
 		return nil
 	}
 
@@ -356,22 +405,26 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 		if req.Term >= s.Persistent.CurrentTerm {
 			s.state = followerState
 		} else {
+			log.Printf("Candidate %s not finding a leader in %s: %d < %d", s.id, req.LeaderId, req.Term, s.Persistent.CurrentTerm)
 			return nil
 		}
 	}
 
-	s.heartbeat = time.Now()
-
 	// 1. Reply false if term < Persistent.CurrentTerm (§5.1)
 	if req.Term < s.Persistent.CurrentTerm {
+		log.Printf("Candidate %s not finding a leader in %s: %d < %d", s.id, req.LeaderId, req.Term, s.Persistent.CurrentTerm)
 		return nil
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
-	if req.PrevLogIndex >= s.lastLogIndex || s.Persistent.Log[req.PrevLogIndex].Term != req.PrevLogTerm {
+	if !(req.PrevLogIndex == 0 && s.lastLogIndex == 0 && req.PrevLogTerm == 0) && (req.PrevLogIndex >= s.lastLogIndex ||
+		s.Persistent.Log[req.PrevLogIndex].Term != req.PrevLogTerm) {
+		log.Printf("Candidate %s not finding an up-to-date leader in %s", s.id, req.LeaderId)
 		return nil
 	}
+
+	s.termChange(req.RPCMessage)
 
 	for i, entry := range req.Entries {
 		realIndex := uint64(i) + req.PrevLogIndex + 1
@@ -393,6 +446,10 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, s.lastLogIndex)
 	}
+
+	rsp.Success = true
+	s.heartbeat = time.Now()
+	log.Printf("Server %s successfully received %d entries from leader %s", s.id, len(req.Entries), req.LeaderId)
 
 	return nil
 }
@@ -418,31 +475,9 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	for _, other := range s.cluster {
 		go func(other ClusterEntry) {
 			if s.lastLogIndex >= other.nextIndex {
-				client, err := rpc.DialHTTP("tcp", other.Address)
+				rsp, err := s.leaderAppendEntries(other, s.Persistent.Log[other.nextIndex:])
 				if err != nil {
 					log.Printf("Could not connect to %s at %s: %s", other.Id, other.Address, err)
-					return
-				}
-
-				req := AppendEntriesRequest{
-					RPCMessage: RPCMessage{
-						Term: s.Persistent.CurrentTerm,
-					},
-					LeaderId:     s.id,
-					PrevLogIndex: other.nextIndex - 1,
-					PrevLogTerm:  s.Persistent.Log[other.nextIndex-1].Term,
-					Entries:      s.Persistent.Log[other.nextIndex:],
-					LeaderCommit: s.commitIndex,
-				}
-
-				var rsp AppendEntriesResponse
-				err = client.Call("Server.AppendEntries", &req, &rsp)
-				if err != nil {
-					log.Printf("AppendEntries to %s at %s failed: %s", other.Id, other.Address, err)
-					return
-				}
-
-				if s.termChange(rsp.RPCMessage) {
 					return
 				}
 
@@ -514,11 +549,13 @@ func (s *Server) start() {
 
 		if s.state == leaderState {
 			if lastLeaderHeartbeat.Add(s.electionTimeout / 2).Before(time.Now()) {
+				log.Printf("Leader %s sending heartbeat", s.id)
 				lastLeaderHeartbeat = time.Now()
-				s.sendHeartbeat()
+				s.leaderSendHeartbeat()
 			}
 		} else if s.state == followerState {
 			if s.heartbeat.Add(s.electionTimeout).Before(time.Now()) {
+				log.Println("No heartbeat", s.heartbeat, s.heartbeat.Add(s.electionTimeout), time.Now())
 				// Got no heartbeat, so start an election
 				s.election()
 			}
