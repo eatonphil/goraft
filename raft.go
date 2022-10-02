@@ -555,7 +555,6 @@ func (s *Server) start() {
 			}
 		} else if s.state == followerState {
 			if s.heartbeat.Add(s.electionTimeout).Before(time.Now()) {
-				log.Println("No heartbeat", s.heartbeat, s.heartbeat.Add(s.electionTimeout), time.Now())
 				// Got no heartbeat, so start an election
 				s.election()
 			}
