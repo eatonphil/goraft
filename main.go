@@ -1,14 +1,14 @@
 package main
 
 import (
-	"time"
 	"bytes"
-	"fmt"
 	"encoding/gob"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type config struct {
@@ -36,8 +36,8 @@ func getConfig() config {
 		if arg == "--cluster" {
 			cluster := os.Args[i+2]
 			var clusterEntry ClusterEntry
-			for _, part := range strings.Split(";", cluster) {
-				idAddress := strings.Split(",", part)
+			for _, part := range strings.Split(cluster, ";") {
+				idAddress := strings.Split(part, ",")
 				clusterEntry.Id = idAddress[0]
 				clusterEntry.Address = idAddress[1]
 				cfg.cluster = append(cfg.cluster, clusterEntry)
@@ -97,7 +97,6 @@ func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
 
 	return nil, nil
 }
-
 
 func main() {
 	cfg := getConfig()

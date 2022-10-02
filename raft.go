@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
@@ -83,6 +84,16 @@ type ClusterEntry struct {
 	matchIndex uint64
 }
 
+type ServerPersistent struct {
+	// The current term
+	CurrentTerm uint64
+
+	// candidateId that received vote in current term (or null if none)
+	VotedFor Optional[string]
+
+	Log []Entry
+}
+
 type ServerState uint
 
 const (
@@ -94,13 +105,7 @@ const (
 type Server struct {
 	// ----------- PERSISTENT STATE -----------
 
-	// The current term
-	currentTerm uint64
-
-	// candidateId that received vote in current term (or null if none)
-	votedFor Optional[string]
-
-	log []Entry
+	Persistent ServerPersistent
 
 	// ----------- READONLY STATE -----------
 
@@ -157,7 +162,6 @@ func newServer(
 		state:           followerState,
 		id:              id,
 		address:         address,
-		currentTerm:     0,
 		electionTimeout: electionTimeout,
 		cluster:         cluster,
 		statemachine:    statemachine,
@@ -169,15 +173,7 @@ func (s *Server) persist() {
 	s.fd.Truncate(0)
 	s.fd.Seek(0, 0)
 	enc := gob.NewEncoder(s.fd)
-	err := enc.Encode(struct {
-		CurrentTerm uint64
-		VotedFor    Optional[string]
-		Log         []Entry
-	}{
-		s.currentTerm,
-		s.votedFor,
-		s.log,
-	})
+	err := enc.Encode(s.Persistent)
 	if err != nil {
 		panic(err)
 	}
@@ -186,26 +182,19 @@ func (s *Server) persist() {
 func (s *Server) restore() {
 	s.fd.Seek(0, 0)
 	dec := gob.NewDecoder(s.fd)
-	err := dec.Decode(struct {
-		CurrentTerm uint64
-		VotedFor    Optional[string]
-		Log         []Entry
-	}{
-		s.currentTerm,
-		s.votedFor,
-		s.log,
-	})
-	// TODO: this will probably panic when the file is first created
-	if err != nil {
+	err := dec.Decode(&s.Persistent)
+	if err != nil && err != io.EOF {
 		panic(err)
 	}
-	s.lastLogIndex = uint64(len(s.log) - 1)
+	if len(s.Persistent.Log) > 0 {
+		s.lastLogIndex = uint64(len(s.Persistent.Log) - 1)
+	}
 }
 
 func (s *Server) termChange(msg RPCMessage) bool {
-	if msg.Term > s.currentTerm {
+	if msg.Term > s.Persistent.CurrentTerm {
 		s.state = followerState
-		s.currentTerm = msg.Term
+		s.Persistent.CurrentTerm = msg.Term
 		s.persist()
 		return true
 	}
@@ -234,7 +223,7 @@ func (s *Server) sendHeartbeat() {
 }
 
 func (s *Server) elected() {
-	log.Println("%s is elected leader for term %d", s.id, s.currentTerm)
+	log.Printf("%s is elected leader for term %d", s.id, s.Persistent.CurrentTerm)
 	s.state = leaderState
 	// Reinitialize volatile leader state after every election
 	for _, others := range s.cluster {
@@ -251,10 +240,10 @@ func (s *Server) election() {
 	}
 
 	// New term and reset to candidate
-	s.currentTerm++
+	s.Persistent.CurrentTerm++
 	s.state = candidateState
 
-	log.Println("%s is starting election for term %d", s.id, s.currentTerm)
+	log.Printf("%s is starting election for term %d", s.id, s.Persistent.CurrentTerm)
 
 	// Random timeout within 150-300ms
 	s.randomElectionTimeout = time.Millisecond * time.Duration(rand.Intn(150)+150)
@@ -274,13 +263,21 @@ func (s *Server) election() {
 				return
 			}
 
+			var lastLogTerm uint64
+			lastLogIndex := s.lastLogIndex
+			if len(s.Persistent.Log) == 0 {
+				lastLogIndex = 0
+			} else {
+				lastLogTerm = s.Persistent.Log[lastLogIndex].Term
+			}
+
 			req := RequestVoteRequest{
 				RPCMessage: RPCMessage{
-					Term: s.currentTerm,
+					Term: s.Persistent.CurrentTerm,
 				},
 				CandidateId:  s.id,
-				LastLogIndex: s.lastLogIndex,
-				LastLogTerm:  s.log[s.lastLogIndex].Term,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
 			}
 			var rsp RequestVoteResponse
 			err = client.Call("Server.RequestVote", req, &rsp)
@@ -319,22 +316,22 @@ outer:
 func (s *Server) RequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) error {
 	rsp.VoteGranted = false
 
-	// 1. Reply false if term < currentTerm (§5.1)
-	if req.Term <= s.currentTerm {
+	// 1. Reply false if term < Persistent.CurrentTerm (§5.1)
+	if req.Term <= s.Persistent.CurrentTerm {
 		return nil
 	}
 
-	// If votedFor is null or candidateId, and candidate’s log is at
+	// If Persistent.VotedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if (!s.votedFor.Set() || s.votedFor.Value() == req.CandidateId) &&
+	if (!s.Persistent.VotedFor.Set() || s.Persistent.VotedFor.Value() == req.CandidateId) &&
 		// Last log index and last log term are the same
-		((req.LastLogIndex == s.lastLogIndex && req.LastLogTerm == s.log[s.lastLogIndex].Term) ||
+		((req.LastLogIndex == s.lastLogIndex && (req.LastLogIndex == 0 || req.LastLogTerm == s.Persistent.Log[s.lastLogIndex].Term)) ||
 			// Or has a later term
-			(req.LastLogTerm > s.currentTerm) ||
+			(req.LastLogTerm > s.Persistent.CurrentTerm) ||
 			// Or is the same term but has more entries
-			(req.LastLogTerm == s.currentTerm && req.LastLogIndex > s.lastLogIndex)) {
+			(req.LastLogTerm == s.Persistent.CurrentTerm && req.LastLogIndex > s.lastLogIndex)) {
 		rsp.VoteGranted = true
-		s.votedFor.Put(req.CandidateId)
+		s.Persistent.VotedFor.Put(req.CandidateId)
 		return nil
 	}
 
@@ -356,7 +353,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 
 	rsp.Success = false
 	if s.state == candidateState {
-		if req.Term >= s.currentTerm {
+		if req.Term >= s.Persistent.CurrentTerm {
 			s.state = followerState
 		} else {
 			return nil
@@ -365,14 +362,14 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 
 	s.heartbeat = time.Now()
 
-	// 1. Reply false if term < currentTerm (§5.1)
-	if req.Term < s.currentTerm {
+	// 1. Reply false if term < Persistent.CurrentTerm (§5.1)
+	if req.Term < s.Persistent.CurrentTerm {
 		return nil
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
-	if req.PrevLogIndex >= s.lastLogIndex || s.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+	if req.PrevLogIndex >= s.lastLogIndex || s.Persistent.Log[req.PrevLogIndex].Term != req.PrevLogTerm {
 		return nil
 	}
 
@@ -381,12 +378,12 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 		// If an existing entry conflicts with a new one (same index
 		// but different terms), delete the existing entry and all that
 		// follow it (§5.3)
-		if realIndex < s.lastLogIndex && s.log[realIndex].Term != req.Term {
-			s.log = s.log[:realIndex]
+		if realIndex < s.lastLogIndex && s.Persistent.Log[realIndex].Term != req.Term {
+			s.Persistent.Log = s.Persistent.Log[:realIndex]
 		}
 
 		// 4. Append any new entries not already in the log
-		s.log = append(s.log, entry)
+		s.Persistent.Log = append(s.Persistent.Log, entry)
 		s.lastLogIndex++
 	}
 	s.persist()
@@ -405,12 +402,12 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		return nil, fmt.Errorf("Cannot call append on non-leader")
 	}
 
-	s.log = append(s.log, Entry{
+	s.Persistent.Log = append(s.Persistent.Log, Entry{
 		Command: command,
-		Term:    s.currentTerm,
+		Term:    s.Persistent.CurrentTerm,
 	})
 	s.persist()
-	s.lastLogIndex = uint64(len(s.log) - 1)
+	s.lastLogIndex = uint64(len(s.Persistent.Log) - 1)
 
 	allServers := len(s.cluster)
 	// Majority needed
@@ -429,14 +426,15 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 
 				req := AppendEntriesRequest{
 					RPCMessage: RPCMessage{
-						Term: s.currentTerm,
+						Term: s.Persistent.CurrentTerm,
 					},
 					LeaderId:     s.id,
 					PrevLogIndex: other.nextIndex - 1,
-					PrevLogTerm:  s.log[other.nextIndex-1].Term,
-					Entries:      s.log[other.nextIndex:],
+					PrevLogTerm:  s.Persistent.Log[other.nextIndex-1].Term,
+					Entries:      s.Persistent.Log[other.nextIndex:],
 					LeaderCommit: s.commitIndex,
 				}
+
 				var rsp AppendEntriesResponse
 				err = client.Call("Server.AppendEntries", &req, &rsp)
 				if err != nil {
@@ -469,11 +467,13 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	}
 
 	// If there exists an N such that N > commitIndex, a majority
-	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+	// of matchIndex[i] ≥ N, and log[N].term == Persistent.CurrentTerm:
 	// set commitIndex = N (§5.3, §5.4).
 	var minMatchIndex = ^uint64(0) /* max */
 	for _, other := range s.cluster {
-		if other.matchIndex >= s.commitIndex && s.log[other.matchIndex].Term == s.currentTerm && other.matchIndex < minMatchIndex {
+		if other.matchIndex >= s.commitIndex &&
+			s.Persistent.Log[other.matchIndex].Term == s.Persistent.CurrentTerm &&
+			other.matchIndex < minMatchIndex {
 			minMatchIndex = other.matchIndex
 			majorityNeeded--
 		}
@@ -508,7 +508,7 @@ func (s *Server) start() {
 	lastLeaderHeartbeat := time.Now()
 	for {
 		if s.commitIndex > s.lastApplied {
-			s.statemachine.Apply(s.log[s.lastApplied].Command)
+			s.statemachine.Apply(s.Persistent.Log[s.lastApplied].Command)
 			s.lastApplied++
 		}
 
