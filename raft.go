@@ -104,6 +104,7 @@ const (
 )
 
 type Server struct {
+	mu sync.Mutex
 	// ----------- PERSISTENT STATE -----------
 
 	// The current term
@@ -142,8 +143,7 @@ type Server struct {
 	commitIndex uint64
 
 	// Index of highest log entry applied to state machine
-	lastApplied   uint64
-	lastAppliedMu sync.Mutex
+	lastApplied uint64
 
 	// Candidate, follower, or leader
 	state ServerState
@@ -213,23 +213,9 @@ func (s *Server) restore() {
 	s.lastLogIndex = uint64(len(s.log) - 1)
 }
 
-func (s *Server) termChange(msg RPCMessage) bool {
-	if msg.Term > s.currentTerm {
-		if s.state == followerState {
-			log.Printf("Server %s is now a follower", s.id)
-		} else {
-			log.Printf("Server %s changed from %s to follower", s.id, s.state)
-		}
-		s.state = followerState
-		s.currentTerm = msg.Term
-		s.persist()
-		return true
-	}
-
-	return false
-}
-
 func (s *Server) leaderAppendEntries(server ClusterMember, entries []Entry) (*AppendEntriesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	client, err := rpc.DialHTTP("tcp", server.Address)
 	if err != nil {
 		return nil, fmt.Errorf("Could not connect to %s at %s: %s", server.Id, server.Address, err)
@@ -252,7 +238,9 @@ func (s *Server) leaderAppendEntries(server ClusterMember, entries []Entry) (*Ap
 		return nil, fmt.Errorf("AppendEntries to %s at %s failed: %s", server.Id, server.Address, err)
 	}
 
-	s.termChange(rsp.RPCMessage)
+	if rsp.RPCMessage.Term > s.currentTerm {
+		s.state = followerState
+	}
 
 	return &rsp, nil
 }
@@ -271,16 +259,9 @@ func (s *Server) leaderSendHeartbeat() {
 	}
 }
 
-func (s *Server) leaderElected() {
-	// Reinitialize volatile leader state after every election
-	for i := range s.cluster {
-		s.cluster[i].nextIndex = s.lastLogIndex + 1
-		s.cluster[i].matchIndex = 0
-	}
-	s.leaderSendHeartbeat()
-}
-
 func (s *Server) election() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// New term and reset to candidate
 	s.currentTerm = s.currentTerm + 1
 	s.persist()
@@ -336,7 +317,9 @@ func (s *Server) election() {
 				votesNeeded.Add(-1)
 			}
 
-			s.termChange(rsp.RPCMessage)
+			if rsp.RPCMessage.Term > s.currentTerm {
+				s.state = followerState
+			}
 		}(member)
 	}
 
@@ -349,13 +332,15 @@ outer:
 			break outer
 		default:
 			if votesNeeded.Load() <= 0 && s.state == candidateState {
-				// Voted for self TODO: is this necessary?
-				// s.votedFor = s.id
-				s.persist()
-
 				log.Printf("Server %s is elected leader for term %d", s.id, s.currentTerm)
 				s.state = leaderState
-				s.leaderElected()
+
+				// Reinitialize volatile leader state after every election
+				for i := range s.cluster {
+					s.cluster[i].nextIndex = s.lastLogIndex + 1
+					s.cluster[i].matchIndex = 0
+				}
+				s.leaderSendHeartbeat()
 				return
 			}
 		}
@@ -369,12 +354,18 @@ outer:
 }
 
 func (s *Server) RequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rsp.VoteGranted = false
 	currentTerm := s.currentTerm
 
 	// 1. Reply false if term < currentTerm (§5.1)
 	if req.Term <= currentTerm {
 		return nil
+	}
+
+	if req.Term > currentTerm {
+		s.state = followerState
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
@@ -404,18 +395,22 @@ func min(a, b uint64) uint64 {
 }
 
 func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rsp.Success = false
+	rsp.Term = req.Term
+
+	if req.Term > s.currentTerm {
+		s.state = followerState
+	}
+
 	if s.state == leaderState {
 		return fmt.Errorf("Leader %s should not be receiving AppendEntries RPC", s.id)
 	}
 
-	rsp.Success = false
 	if s.state == candidateState {
-		if req.Term >= s.currentTerm {
-			s.state = followerState
-		} else {
-			log.Printf("Candidate %s not finding a leader in %s: %d < %d", s.id, req.LeaderId, req.Term, s.currentTerm)
-			return nil
-		}
+		log.Printf("Candidate %s not finding a leader in %s: %d < %d", s.id, req.LeaderId, req.Term, s.currentTerm)
+		return nil
 	}
 
 	// 1. Reply false if term < currentTerm (§5.1)
@@ -430,8 +425,6 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 		log.Printf("Server %s not finding an up-to-date leader in %s", s.id, req.LeaderId)
 		return nil
 	}
-
-	s.termChange(req.RPCMessage)
 
 	for i, entry := range req.Entries {
 		realIndex := uint64(i) + req.PrevLogIndex + 1
@@ -463,7 +456,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 }
 
 func (s *Server) leaderApplyToFollower(follower ClusterMember) {
-	for {
+	for s.state == leaderState {
 		if s.lastLogIndex >= follower.nextIndex {
 			log.Println("How many to update", follower.nextIndex, len(s.log[follower.nextIndex:]))
 			rsp, err := s.leaderAppendEntries(follower, s.log[follower.nextIndex:])
@@ -491,6 +484,8 @@ func (s *Server) leaderApplyToFollower(follower ClusterMember) {
 }
 
 func (s *Server) Apply(command []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.state != leaderState {
 		return nil, fmt.Errorf("Cannot call append on non-leader")
 	}
@@ -543,10 +538,10 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		s.commitIndex = minMatchIndex
 	}
 
-	s.lastAppliedMu.Lock()
+	s.mu.Lock()
 	rsp, err := s.statemachine.Apply(command)
 	s.lastApplied = s.commitIndex
-	s.lastAppliedMu.Unlock()
+	s.mu.Unlock()
 
 	return rsp, err
 }
@@ -570,7 +565,7 @@ func (s *Server) Start() {
 
 	lastLeaderHeartbeat := time.Now()
 	for {
-		s.lastAppliedMu.Lock()
+		s.mu.Lock()
 		if s.commitIndex > s.lastApplied {
 			// lastApplied + 1 since first real entry is at 1, not 0
 			_, err := s.statemachine.Apply(s.log[s.lastApplied+1].Command)
@@ -579,7 +574,7 @@ func (s *Server) Start() {
 			}
 			s.lastApplied = s.lastApplied + 1
 		}
-		s.lastAppliedMu.Unlock()
+		s.mu.Unlock()
 
 		if s.state == leaderState {
 			if lastLeaderHeartbeat.Add(s.electionTimeout / 2).Before(time.Now()) {
