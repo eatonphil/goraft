@@ -99,6 +99,7 @@ type Server struct {
 	chans struct {
 		appendEntries chan appendEntriesMessage
 		requestVote chan requestVoteMessage
+		apply chan applyMessage
 	}
 
 	lastLogIndex uint64

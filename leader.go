@@ -30,7 +30,6 @@ func (s *Server) leaderAppendEntries(server ClusterMember, entries []Entry) (*Ap
 	return &rsp, nil
 }
 
-
 func (s *Server) leaderApplyToFollower(follower ClusterMember) {
 	for s.state == leaderState {
 		if s.lastLogIndex >= follower.nextIndex {
@@ -76,4 +75,3 @@ func (s *Server) leaderTick() {
 		}
 	}
 }
-
