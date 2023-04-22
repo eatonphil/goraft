@@ -85,7 +85,6 @@ type ClusterMember struct {
 	rpcClient *rpc.Client
 }
 
-
 func (c *ClusterMember) rpcCall(name string, req, rsp any) error {
 	var err error
 	if c.rpcClient == nil {
@@ -175,11 +174,11 @@ func NewServer(
 	clusterIndex int,
 ) *Server {
 	s := &Server{
-		id:              cluster[clusterIndex].Id,
-		address:         cluster[clusterIndex].Address,
-		cluster:         cluster,
-		statemachine:    statemachine,
-		metadataDir:     metadataDir,
+		id:           cluster[clusterIndex].Id,
+		address:      cluster[clusterIndex].Address,
+		cluster:      cluster,
+		statemachine: statemachine,
+		metadataDir:  metadataDir,
 		clusterIndex: clusterIndex,
 	}
 	s.state = followerState
@@ -264,7 +263,7 @@ func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesRespo
 	s.log = append(s.log, req.Entries...)
 	s.persist()
 	if req.LeaderCommit > s.commitIndex {
-		s.commitIndex = min(req.LeaderCommit, logLen - 1)
+		s.commitIndex = min(req.LeaderCommit, logLen-1)
 	}
 
 	s.mu.Unlock()
@@ -273,6 +272,7 @@ func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesRespo
 }
 
 var ErrApplyToLeader = errors.New("Cannot apply message to follower, apply to leader.")
+
 func (s *Server) Apply(command []byte) ([]byte, error) {
 	s.mu.Lock()
 	if s.state != leaderState {
@@ -281,11 +281,11 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	}
 
 	s.log = append(s.log, Entry{
-		Term: s.currentTerm,
+		Term:    s.currentTerm,
 		Command: command,
 	})
 	s.persist()
-	lastLogIndex := uint64(len(s.log)-1)
+	lastLogIndex := uint64(len(s.log) - 1)
 	s.mu.Unlock()
 
 	// Leader already has it in the log, so just need exactly floor(cluster.len / 2)m
@@ -293,7 +293,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	var commitsNeededMu sync.Mutex
 	committed := make(chan bool)
 	if len(s.cluster) == 0 {
-		go func () {
+		go func() {
 			committed <- true
 		}()
 	}
@@ -303,7 +303,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 			continue
 		}
 
-		go func (server *ClusterMember) {
+		go func(server *ClusterMember) {
 			for {
 				s.mu.Lock()
 				if lastLogIndex < server.nextIndex {
@@ -312,10 +312,10 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 				}
 
 				req := AppendEntriesRequest{
-					LeaderId: s.cluster[s.clusterIndex].Id,
+					LeaderId:     s.cluster[s.clusterIndex].Id,
 					PrevLogIndex: server.nextIndex - 1,
-					PrevLogTerm: s.log[server.nextIndex - 1].Term,
-					Entries: append(s.log[server.nextIndex:lastLogIndex]),
+					PrevLogTerm:  s.log[server.nextIndex-1].Term,
+					Entries:      append(s.log[server.nextIndex:lastLogIndex]),
 					LeaderCommit: s.commitIndex,
 				}
 				end := uint64(len(s.log) - 1)
@@ -368,7 +368,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 // Make sure rand is seeded
 func (s *Server) Start() {
 	var err error
-	s.fd, err = os.OpenFile(path.Join(s.metadataDir, "md_" + s.id + ".dat"), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
+	s.fd, err = os.OpenFile(path.Join(s.metadataDir, "md_"+s.id+".dat"), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
 	if err != nil {
 		panic(err)
 	}
@@ -382,7 +382,7 @@ func (s *Server) Start() {
 	}
 	mux := http.NewServeMux()
 	mux.Handle(rpc.DefaultRPCPath, rpcServer)
-	
+
 	go http.Serve(l, mux)
 
 	//for {
