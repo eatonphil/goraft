@@ -123,6 +123,8 @@ const (
 )
 
 type Server struct {
+	Debug bool
+
 	mu sync.Mutex
 	// ----------- PERSISTENT STATE -----------
 
@@ -190,6 +192,9 @@ func NewServer(
 	return s
 }
 
+// Weird thing to note is that writing to a deleted disk is not an
+// error on Linux. So if these files are deleted, you won't know about
+// that until the process restarts.
 func (s *Server) persist() {
 	s.fd.Truncate(0)
 	s.fd.Seek(0, 0)
@@ -199,13 +204,13 @@ func (s *Server) persist() {
 		Log:         s.log,
 		VotedFor:    s.votedFor,
 	})
-	s.debug(fmt.Sprintf("Term: %d. Log Len: %d. Voted For: %s.", s.currentTerm, len(s.log), s.votedFor))
 	if err != nil {
 		panic(err)
 	}
 	if err = s.fd.Sync(); err != nil {
 		panic(err)
 	}
+	s.debug(fmt.Sprintf("PERSISTED! Term: %d. Log Len: %d. Voted For: %s.", s.currentTerm, len(s.log), s.votedFor))
 }
 
 func (s *Server) restore() {
@@ -215,7 +220,7 @@ func (s *Server) restore() {
 	err := dec.Decode(&p)
 	if err != nil {
 		// Always must be one log entry
-		if err == io.EOF {
+		if err == io.EOF || io.ErrUnexpectedEOF {
 			s.log = []Entry{{}}
 		} else {
 			panic(err)
@@ -248,6 +253,9 @@ func (s *Server) debugmsg(msg string) string {
 }
 
 func (s *Server) debug(msg string) {
+	if !s.Debug {
+		return
+	}
 	fmt.Println(s.debugmsg(msg))
 }
 

@@ -68,6 +68,16 @@ func (kvsm *kvStateMachine) Apply(msg []byte) ([]byte, error) {
 	return res, nil
 }
 
+var letters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func randomString() string {
+	b := make([]byte, 16)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
 func main() {
 	rand.Seed(0)
 
@@ -94,10 +104,44 @@ func main() {
 	s3 := goraft.NewServer(cluster, statemachine, ".", 2)
 
 	s1.Start()
+	s1.Debug = false
 	s2.Start()
+	s2.Debug = false
 	s3.Start()
+	s3.Debug = false
 
-	_, err := s1.Apply(kvsmMessage_Set("a", "1"))
+	var randKey, randValue string
+	for i := 0; i < 1000; i++ {
+		key := randomString()
+		value := randomString()
+
+		if rand.Intn(100) > 90 || i == 0 {
+			randKey = key
+			randValue = value
+		}
+
+		_, err := s1.Apply(kvsmMessage_Set(key, value))
+		if err != nil {
+			panic(err)
+		}
+		goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
+		goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
+	}
+
+	v, err := s1.Apply(kvsmMessage_Get(randKey))
+	if err != nil {
+		panic(err)
+	}
+	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
+	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
+
+	fmt.Printf("%s = %s, expected: %s\n", randKey, string(v), randValue)
+}
+
+/*
+	  OLD
+
+	   _, err := s1.Apply(kvsmMessage_Set("a", "1"))
 	if err != nil {
 		panic(err)
 	}
@@ -118,5 +162,5 @@ func main() {
 	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
 	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
 
-	fmt.Printf("a = %s\n", string(v))
-}
+
+*/
