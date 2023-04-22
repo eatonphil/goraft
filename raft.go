@@ -4,14 +4,12 @@ import (
 	"encoding/gob"
 	"errors"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
 	"path"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -85,6 +83,19 @@ type ClusterMember struct {
 
 	// TCP connection
 	rpcClient *rpc.Client
+}
+
+
+func (c *ClusterMember) rpcCall(name string, req, rsp any) error {
+	var err error
+	if c.rpcClient == nil {
+		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
+		if err != nil {
+			return err
+		}
+	}
+
+	return c.rpcClient.Call(name, req, rsp)
 }
 
 type PersistentState struct {
@@ -210,6 +221,10 @@ func (s *Server) restore() {
 		s.currentTerm = p.CurrentTerm
 	}
 	s.lastLogIndex = uint64(len(s.log) - 1)
+
+	for i := range s.cluster {
+		s.cluster[i].nextIndex = s.lastLogIndex + 1
+	}
 }
 
 func (s *Server) RequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) error {
@@ -224,7 +239,7 @@ func min[T ~int | ~uint64](a, b T) T {
 	return b
 }
 
-func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResponse) error {
+func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
 	s.mu.Lock()
 
 	rsp.Term = s.currentTerm
@@ -247,6 +262,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, rsp *AppendEntriesResp
 	}
 
 	s.log = append(s.log, req.Entries...)
+	s.persist()
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, logLen - 1)
 	}
@@ -268,12 +284,12 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		Term: s.currentTerm,
 		Command: command,
 	})
+	s.persist()
 	lastLogIndex := uint64(len(s.log)-1)
 	s.mu.Unlock()
 
-	var commitsNeeded atomic.Uint32
-	// Leader already has it in the log, so just need exactly floor(cluster.len / 2)
-	commitsNeeded.Store(uint32(len(s.cluster) / 2))
+	// Leader already has it in the log, so just need exactly floor(cluster.len / 2)m
+	commitsNeeded := len(s.cluster) / 2
 	var commitsNeededMu sync.Mutex
 	committed := make(chan bool)
 	if len(s.cluster) == 0 {
@@ -302,18 +318,18 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 					Entries: append(s.log[server.nextIndex:lastLogIndex]),
 					LeaderCommit: s.commitIndex,
 				}
-				var end = len(s.log) - 1
+				end := uint64(len(s.log) - 1)
 
 				s.mu.Unlock()
 
 				var rsp AppendEntriesResponse
-				err := s.rpcCall("AppendEntries", &req, &rsp)
+				err := server.rpcCall("Server.AppendEntries", req, &rsp)
 				if err != nil {
 					panic("Unexpected RPC failure: " + err.Error())
 				}
 
 				s.mu.Lock()
-				if req.Success {
+				if rsp.Success {
 					server.nextIndex = end
 					server.matchIndex = end + 1
 				} else {
@@ -322,7 +338,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 				}
 				s.mu.Unlock()
 
-				if req.Success {
+				if rsp.Success {
 					commitsNeededMu.Lock()
 
 					if commitsNeeded > 0 {
@@ -336,7 +352,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 					break
 				}
 			}
-		}(&server[i])
+		}(&s.cluster[i])
 	}
 
 	<-committed
@@ -352,19 +368,22 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 // Make sure rand is seeded
 func (s *Server) Start() {
 	var err error
-	s.fd, err = os.OpenFile(path.Join(s.metadataDir, s.id), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
+	s.fd, err = os.OpenFile(path.Join(s.metadataDir, "md_" + s.id + ".dat"), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
 	if err != nil {
 		panic(err)
 	}
 	s.restore()
 
-	rpc.Register(s)
-	rpc.HandleHTTP()
+	rpcServer := rpc.NewServer()
+	rpcServer.Register(s)
 	l, err := net.Listen("tcp", s.address)
 	if err != nil {
 		panic(err)
 	}
-	go http.Serve(l, nil)
+	mux := http.NewServeMux()
+	mux.Handle(rpc.DefaultRPCPath, rpcServer)
+	
+	go http.Serve(l, mux)
 
 	//for {
 	//	s.mu.Lock()
