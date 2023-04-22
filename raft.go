@@ -3,6 +3,7 @@ package goraft
 import (
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,12 @@ import (
 	"sync"
 	"time"
 )
+
+func Assert[T comparable](msg string, a, b T) {
+	if a != b {
+		panic(fmt.Sprintf("%s. Got a = %#v, b = %#v", msg, a, b))
+	}
+}
 
 type StateMachine interface {
 	Apply(cmd []byte) ([]byte, error)
@@ -149,8 +156,6 @@ type Server struct {
 
 	// ----------- VOLATILE STATE -----------
 
-	lastLogIndex uint64
-
 	// Index of highest log entry known to be committed
 	commitIndex uint64
 
@@ -194,6 +199,7 @@ func (s *Server) persist() {
 		Log:         s.log,
 		VotedFor:    s.votedFor,
 	})
+	s.debug(fmt.Sprintf("Term: %d. Log Len: %d. Voted For: %s.", s.currentTerm, len(s.log), s.votedFor))
 	if err != nil {
 		panic(err)
 	}
@@ -219,10 +225,9 @@ func (s *Server) restore() {
 		s.votedFor = p.VotedFor
 		s.currentTerm = p.CurrentTerm
 	}
-	s.lastLogIndex = uint64(len(s.log) - 1)
 
 	for i := range s.cluster {
-		s.cluster[i].nextIndex = s.lastLogIndex + 1
+		s.cluster[i].nextIndex = uint64(len(s.log))
 	}
 }
 
@@ -238,6 +243,18 @@ func min[T ~int | ~uint64](a, b T) T {
 	return b
 }
 
+func (s *Server) debugmsg(msg string) string {
+	return fmt.Sprintf("%s [Id: %s] %s", time.Now().Format(time.RFC3339), s.id, msg)
+}
+
+func (s *Server) debug(msg string) {
+	fmt.Println(s.debugmsg(msg))
+}
+
+func Server_assert[T comparable](s *Server, msg string, a, b T) {
+	Assert(s.debugmsg(msg), a, b)
+}
+
 func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
 	s.mu.Lock()
 
@@ -246,10 +263,16 @@ func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesRespo
 
 	logLen := uint64(len(s.log))
 
-	validPreviousLog := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogIndex
+	validPreviousLog := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm
 
 	if req.Term < s.currentTerm || !validPreviousLog {
 		s.mu.Unlock()
+		return nil
+	}
+
+	if len(req.Entries) == 0 {
+		s.mu.Unlock()
+		rsp.Success = true
 		return nil
 	}
 
@@ -260,7 +283,8 @@ func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesRespo
 		s.log = s.log[:req.PrevLogIndex]
 	}
 
-	s.log = append(s.log, req.Entries...)
+	Assert("Must be at least one log entry at all times", len(s.log) > 0, true)
+	s.log = append(s.log[:req.PrevLogIndex+1], req.Entries...)
 	s.persist()
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, logLen-1)
@@ -289,7 +313,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	s.mu.Unlock()
 
 	// Leader already has it in the log, so just need exactly floor(cluster.len / 2)m
-	commitsNeeded := len(s.cluster) / 2
+	commitsNeeded := (len(s.cluster) / 2) + 1
 	var commitsNeededMu sync.Mutex
 	committed := make(chan bool)
 	if len(s.cluster) == 0 {
@@ -315,10 +339,10 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 					LeaderId:     s.cluster[s.clusterIndex].Id,
 					PrevLogIndex: server.nextIndex - 1,
 					PrevLogTerm:  s.log[server.nextIndex-1].Term,
-					Entries:      append(s.log[server.nextIndex:lastLogIndex]),
+					Entries:      s.log[server.nextIndex : lastLogIndex+1],
 					LeaderCommit: s.commitIndex,
 				}
-				end := uint64(len(s.log) - 1)
+				Server_assert(s, "Sending at least one entry", len(req.Entries) > 0, true)
 
 				s.mu.Unlock()
 
@@ -330,9 +354,13 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 
 				s.mu.Lock()
 				if rsp.Success {
-					server.nextIndex = end
-					server.matchIndex = end + 1
+					prev := server.nextIndex
+					server.nextIndex = lastLogIndex + 1
+					server.matchIndex = lastLogIndex + 2
+					s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", server.Id, prev, server.nextIndex))
+
 				} else {
+					s.debug(fmt.Sprintf("Forced to go back to %d for: %s\n", server.nextIndex-1, server.Id))
 					server.nextIndex--
 					req.PrevLogIndex--
 				}
@@ -359,6 +387,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 
 	s.mu.Lock()
 	s.commitIndex = lastLogIndex
+	s.lastApplied = s.commitIndex
 	res, err := s.statemachine.Apply(command)
 	s.mu.Unlock()
 
@@ -373,6 +402,7 @@ func (s *Server) Start() {
 		panic(err)
 	}
 	s.restore()
+	Server_assert(s, "At least one log entry", len(s.log) > 0, true)
 
 	rpcServer := rpc.NewServer()
 	rpcServer.Register(s)
@@ -396,4 +426,11 @@ func (s *Server) MakeLeader() {
 	s.mu.Lock()
 	s.state = leaderState
 	s.mu.Unlock()
+}
+
+func (s *Server) Entries() int {
+	s.mu.Lock()
+	e := len(s.log)
+	s.mu.Unlock()
+	return e
 }

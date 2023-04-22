@@ -101,16 +101,22 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
+	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
 
 	_, err = s1.Apply(kvsmMessage_Set("b", "2"))
 	if err != nil {
 		panic(err)
 	}
+	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
+	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
 
 	v, err := s1.Apply(kvsmMessage_Get("a"))
 	if err != nil {
 		panic(err)
 	}
+	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
+	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
 
 	fmt.Printf("a = %s\n", string(v))
 }
