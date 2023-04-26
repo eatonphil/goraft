@@ -99,11 +99,10 @@ func main() {
 	statemachine := newKvSM()
 
 	s1 := goraft.NewServer(cluster, statemachine, ".", 0)
-	s1.BecomeLeader()
 	s2 := goraft.NewServer(cluster, statemachine, ".", 1)
 	s3 := goraft.NewServer(cluster, statemachine, ".", 2)
 
-	DEBUG := false
+	DEBUG := true
 	s1.Start()
 	s1.Debug = DEBUG
 	s2.Start()
@@ -121,16 +120,35 @@ func main() {
 			randValue = value
 		}
 
-		_, err := s1.Apply(kvsmMessage_Set(key, value))
-		if err != nil {
-			panic(err)
+	foundALeader:
+		for {
+			for _, s := range []*goraft.Server{s1, s2, s3} {
+				_, err := s.Apply(kvsmMessage_Set(key, value))
+				if err == goraft.ErrApplyToLeader {
+					continue
+				} else if err != nil {
+					panic(err)
+				} else {
+					break foundALeader
+				}
+			}
 		}
+
 		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
+
 	}
 
-	v, err := s1.Apply(kvsmMessage_Get(randKey))
-	if err != nil {
-		panic(err)
+	var v []byte
+	var err error
+	for _, s := range []*goraft.Server{s1, s2, s3} {
+		v, err = s.Apply(kvsmMessage_Get(randKey))
+		if err == goraft.ErrApplyToLeader {
+			continue
+		} else if err != nil {
+			panic(err)
+		} else {
+			break
+		}
 	}
 
 	goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
