@@ -10,7 +10,8 @@ import (
 	"net/rpc"
 	"os"
 	"path"
-	"sync"
+	//"sync"
+	sync "github.com/sasha-s/go-deadlock"
 	"time"
 )
 
@@ -24,9 +25,15 @@ type StateMachine interface {
 	Apply(cmd []byte) ([]byte, error)
 }
 
+type applyResult struct {
+	res []byte
+	err error
+}
+
 type Entry struct {
 	Command []byte
 	Term    uint64
+	result chan applyResult
 }
 
 type RPCMessage struct {
@@ -90,18 +97,6 @@ type ClusterMember struct {
 
 	// TCP connection
 	rpcClient *rpc.Client
-}
-
-func (c *ClusterMember) rpcCall(name string, req, rsp any) error {
-	var err error
-	if c.rpcClient == nil {
-		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
-		if err != nil {
-			return err
-		}
-	}
-
-	return c.rpcClient.Call(name, req, rsp)
 }
 
 type PersistentState struct {
@@ -220,7 +215,7 @@ func (s *Server) restore() {
 	err := dec.Decode(&p)
 	if err != nil {
 		// Always must be one log entry
-		if err == io.EOF || io.ErrUnexpectedEOF {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			s.log = []Entry{{}}
 		} else {
 			panic(err)
@@ -236,12 +231,24 @@ func (s *Server) restore() {
 	}
 }
 
-func (s *Server) RequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) error {
+func (s *Server) requestVote() {
+	// TODO
+}
+
+func (s *Server) HandleRequestVote(req *RequestVoteRequest, rsp *RequestVoteResponse) error {
 	panic("Unsupported")
 }
 
 func min[T ~int | ~uint64](a, b T) T {
 	if a < b {
+		return a
+	}
+
+	return b
+}
+
+func max[T ~int | ~uint64](a, b T) T {
+	if a > b {
 		return a
 	}
 
@@ -263,8 +270,27 @@ func Server_assert[T comparable](s *Server, msg string, a, b T) {
 	Assert(s.debugmsg(msg), a, b)
 }
 
-func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
+func (s *Server) updateTerm(msg RPCMessage) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if msg.Term > s.currentTerm {
+		s.debug("Transitioning to follower")
+		s.currentTerm = msg.Term
+		s.state = followerState
+		s.votedFor = ""
+	}
+}
+
+func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
+	s.updateTerm(req.RPCMessage)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.Term == s.currentTerm && s.state == candidateState {
+		s.state = followerState
+	}
 
 	rsp.Term = s.currentTerm
 	rsp.Success = false
@@ -274,12 +300,10 @@ func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesRespo
 	validPreviousLog := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm
 
 	if req.Term < s.currentTerm || !validPreviousLog {
-		s.mu.Unlock()
 		return nil
 	}
 
 	if len(req.Entries) == 0 {
-		s.mu.Unlock()
 		rsp.Success = true
 		return nil
 	}
@@ -296,9 +320,15 @@ func (s *Server) AppendEntries(req AppendEntriesRequest, rsp *AppendEntriesRespo
 	s.persist()
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, logLen-1)
+
+		// Also set own matchIndex
+		for i := range s.cluster {
+			if i == s.clusterIndex {
+				s.cluster[i].matchIndex = s.commitIndex
+			}
+		}
 	}
 
-	s.mu.Unlock()
 	rsp.Success = true
 	return nil
 }
@@ -312,25 +342,43 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		return nil, ErrApplyToLeader
 	}
 
+	resultChan := make(chan applyResult)
 	s.log = append(s.log, Entry{
 		Term:    s.currentTerm,
 		Command: command,
+		result: resultChan,
 	})
 	s.persist()
+	s.mu.Unlock()
+
+	// TODO: What happens if this takes too long?
+	result := <-resultChan
+	return result.res, result.err
+}
+
+func (s *Server) rpcCall(c *ClusterMember, name string, req, rsp any) error {
+	var err error
+	s.mu.Lock()
+	if c.rpcClient == nil {
+		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	} else {
+		s.mu.Unlock()
+	}
+
+	return c.rpcClient.Call(name, req, rsp)
+}
+
+func (s *Server) appendEntries() {
+	s.mu.Lock()
 	lastLogIndex := uint64(len(s.log) - 1)
 	s.mu.Unlock()
 
-	// Leader already has it in the log, so just need exactly floor(cluster.len / 2)m
-	commitsNeeded := (len(s.cluster) / 2) + 1
-	var commitsNeededMu sync.Mutex
-	committed := make(chan bool)
-	if len(s.cluster) == 0 {
-		go func() {
-			committed <- true
-		}()
-	}
-
 	for i := range s.cluster {
+		// Don't need to send message to self
 		if i == s.clusterIndex {
 			continue
 		}
@@ -338,7 +386,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		go func(server *ClusterMember) {
 			for {
 				s.mu.Lock()
-				if lastLogIndex < server.nextIndex {
+				if lastLogIndex < server.matchIndex {
 					s.mu.Unlock()
 					return
 				}
@@ -350,56 +398,87 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 					Entries:      s.log[server.nextIndex : lastLogIndex+1],
 					LeaderCommit: s.commitIndex,
 				}
-				Server_assert(s, "Sending at least one entry", len(req.Entries) > 0, true)
 
 				s.mu.Unlock()
 
 				var rsp AppendEntriesResponse
-				err := server.rpcCall("Server.AppendEntries", req, &rsp)
+				err := s.rpcCall(server, "Server.HandleAppendEntriesRequest", req, &rsp)
 				if err != nil {
 					panic("Unexpected RPC failure: " + err.Error())
 				}
 
 				s.mu.Lock()
-				if rsp.Success {
+				dropStaleResponse := rsp.Term < s.currentTerm
+				if rsp.Success && !dropStaleResponse {
 					prev := server.nextIndex
 					server.nextIndex = lastLogIndex + 1
-					server.matchIndex = lastLogIndex + 2
+					server.matchIndex = lastLogIndex + 1
 					s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", server.Id, prev, server.nextIndex))
-
+					s.mu.Unlock()
+					return
 				} else {
-					s.debug(fmt.Sprintf("Forced to go back to %d for: %s\n", server.nextIndex-1, server.Id))
-					server.nextIndex--
-					req.PrevLogIndex--
+					server.nextIndex = max(server.nextIndex - 1, 1)
+					req.PrevLogIndex = max(req.PrevLogIndex - 1, 1)
+					s.debug(fmt.Sprintf("Forced to go back to %d for: %s\n", server.nextIndex, server.Id))
 				}
 				s.mu.Unlock()
-
-				if rsp.Success {
-					commitsNeededMu.Lock()
-
-					if commitsNeeded > 0 {
-						commitsNeeded--
-						if commitsNeeded == 0 {
-							committed <- true
-						}
-					}
-
-					commitsNeededMu.Unlock()
-					break
-				}
 			}
 		}(&s.cluster[i])
 	}
+}
 
-	<-committed
-
+func (s *Server) advanceCommitIndex() {
 	s.mu.Lock()
-	s.commitIndex = lastLogIndex
-	s.lastApplied = s.commitIndex
-	res, err := s.statemachine.Apply(command)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
-	return res, err
+	for i := uint64(len(s.log) - 1); i > s.commitIndex; i-- {
+		quorum := len(s.cluster) / 2 + 1
+		for _, server := range s.cluster {
+			if quorum == 0 {
+				break
+			}
+
+			if server.matchIndex >= i {
+				quorum--
+			}
+		}
+
+		if quorum == 0 {
+			s.commitIndex = i
+			s.debug(fmt.Sprintf("New commit index: %d", i))
+			break
+		}
+	}
+
+	for s.lastApplied <= s.commitIndex {
+		if s.lastApplied == 0 {
+			// First entry is always a blank one.
+			s.lastApplied++
+			continue
+		}
+
+		s.debug(fmt.Sprintf("Applying %d\n", s.lastApplied))
+		log := s.log[s.lastApplied]
+		// TODO: what if Apply() takes too long?
+		res, err := s.statemachine.Apply(log.Command)
+		if log.result != nil {
+			log.result <- applyResult{
+				res: res,
+				err: err,
+			}
+		}
+
+		s.lastApplied++
+	}
+}
+
+func (s *Server) maybeTimeout() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hasTimedOut := false // TODO: actually handle this
+	if hasTimedOut {
+		s.state = candidateState
+	}
 }
 
 // Make sure rand is seeded
@@ -423,17 +502,38 @@ func (s *Server) Start() {
 
 	go http.Serve(l, mux)
 
-	//for {
-	//	s.mu.Lock()
-	//	state := s.state
-	//}
+	go func () {
+		ticker := time.NewTicker( time.Second)
+		
+	for range ticker.C {
+		s.mu.Lock()
+		state := s.state
+		s.mu.Unlock()
+
+		switch state {
+		case leaderState:
+			s.appendEntries()
+			s.advanceCommitIndex()
+		case followerState:
+			s.maybeTimeout()
+		case candidateState:
+			s.maybeTimeout()
+			s.requestVote()
+		}
+	}
+	}()
 }
 
-// TODO: delete this
-func (s *Server) MakeLeader() {
+// TODO: make this private
+func (s *Server) BecomeLeader() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.state = leaderState
-	s.mu.Unlock()
+	for i := range s.cluster {
+		s.cluster[i].matchIndex = 0
+		s.cluster[i].nextIndex = uint64(len(s.log) + 1)
+	}
 }
 
 func (s *Server) Entries() int {
