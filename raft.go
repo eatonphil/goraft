@@ -97,7 +97,7 @@ type ClusterMember struct {
 	matchIndex uint64
 
 	votedFor string
-	voted bool
+	voted    bool
 
 	// TCP connection
 	rpcClient *rpc.Client
@@ -500,7 +500,7 @@ func (s *Server) appendEntries() {
 
 			var entries []Entry
 			if server.nextIndex < lastLogIndex {
-				entries = s.log[server.nextIndex : lastLogIndex + 1]
+				entries = s.log[server.nextIndex : lastLogIndex+1]
 			}
 			req := AppendEntriesRequest{
 				LeaderId:     s.cluster[s.clusterIndex].Id,
