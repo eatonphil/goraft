@@ -142,7 +142,6 @@ func main() {
 		}
 
 		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
-
 	}
 
 	var v []byte

@@ -606,7 +606,8 @@ func (s *Server) advanceCommitIndex() {
 			lastLogIndex = uint64(len(s.log) - 1)
 		}
 		for i := lastLogIndex; i > s.commitIndex; i-- {
-			quorum := len(s.cluster)/2 + 1
+			// not `len(s.cluster)/2 + 1` since the leader already has the entry.
+			quorum := len(s.cluster)/2
 			for j := range s.cluster {
 				if quorum == 0 {
 					break

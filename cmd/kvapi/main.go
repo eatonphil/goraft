@@ -27,11 +27,6 @@ type Command struct {
 }
 
 func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
-	// no-op
-	if cmd == nil {
-		return nil, nil
-	}
-
 	dec := json.NewDecoder(bytes.NewReader(cmd))
 	var c Command
 	err := dec.Decode(&c)
@@ -54,6 +49,10 @@ type httpServer struct {
 	db   *sync.Map
 }
 
+//
+// Example:
+//   curl http://localhost:2020/set -d '{"key": "x", "value": "1"}' -X POST
+//
 func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var c Command
