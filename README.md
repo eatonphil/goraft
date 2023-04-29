@@ -1,6 +1,6 @@
 # goraft
 
-A minimal implementation of Raft in Go.
+A minimal implementation of Raft in Go. [Demo video](https://www.youtube.com/watch?v=cIR8RoN2LDU).
 
 NOT FOR PRODUCTION USE.
 
