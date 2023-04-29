@@ -1,31 +1,68 @@
-# goraft (WIP)
+# goraft
 
 A minimal implementation of Raft in Go.
 
 NOT FOR PRODUCTION USE.
 
+# Distributed Key-Value Store API
+
 Try out the builtin distributed key-value API.
 
-```bash
+```console
 $ cd cmd/kvapi && go build
-$ rm -rf metadata && mkdir metadata
+$ rm *.dat
 ```
 
-In terminal 1:
-```
-./cmd/kvapi/kvapi --http :9000 --node 0 --cluster "0,:8080;1,:8081;2,:8082"
-```
+## Terminal 1
 
-In terminal 2:
-
-```bash
-./cmd/kvapi/kvapi --http :9001 --node 1 --cluster "0,:8080;1,:8081;2,:8082"
+```console
+$ ./kvapi --node 1 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
 ```
 
-In terminal 3:
+## Terminal 2
 
-```bash
-./cmd/kvapi/kvapi --http :9002 --node 2 --cluster "0,:8080;1,:8081;2,:8082"
+```console
+$ ./kvapi --node 1 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
 ```
 
-Then in terminal 4:
+## Terminal 3
+
+```console
+$ ./kvapi --node 2 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
+```
+
+## Terminal 4
+
+To set a key:
+
+```console
+$ curl -v http://localhost:2020/set -d '{"key": "y", "value": "hello"}' -X POST
+```
+
+To get a key:
+
+```console
+$ curl -v http://localhost:2021/get\?key\=y
+```
+
+## Simulator
+
+Not particularly aggressive yet but does some minimal testing.
+
+```console
+$ cd cmd/sim
+$ go run main.go
+```
+
+# References
+
+* [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf): The Raft paper.
+* [raft.tla](https://github.com/ongardie/raft.tla/blob/master/raft.tla): Diego Ongaro's TLA+ spec for Raft.
+* Jon Gjengset's [Students' Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/)
+* Jack Vanlightly's [Detecting Bugs in Data Infrastructure using Formal Methods (TLA+ Series Part 1)](https://medium.com/splunk-maas/detecting-bugs-in-data-infrastructure-using-formal-methods-704fde527c58): An intro to TLA+.
+
+Other useful implementations to peer at:
+
+* Hashicorp's [Raft implementation](https://github.com/hashicorp/raft) in Go: Although it's often quite complicated to learn from since it actually is intended for production.
+* Eli Bendersky's [Raft implementation](https://github.com/eliben/raft) in Go: Although it gets confusing because it uses negative numbers for terms whereas the paper does not.
+* Jing Yang's [Raft implementation](https://github.com/ditsing/ruaft) in Rust.
