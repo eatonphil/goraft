@@ -444,7 +444,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 		(req.PrevLogIndex < logLen &&
 			s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
 	if !validPreviousLog {
-		s.debug("Not a valid log")
+		s.debug("Not a valid log.")
 		s.mu.Unlock()
 		return nil
 	}
@@ -458,16 +458,9 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	}
 
 	s.log = append(s.log, req.Entries...)
-	Assert("Log contains new entries", len(s.log), int(logLen)+len(req.Entries))
+	Assert("Log contains new entries (if any)", len(s.log), int(logLen)+len(req.Entries))
 	if req.LeaderCommit > s.commitIndex {
-		s.commitIndex = min(req.LeaderCommit, logLen-1)
-
-		// Also set own matchIndex
-		for i := range s.cluster {
-			if i == s.clusterIndex {
-				s.cluster[i].matchIndex = s.commitIndex
-			}
-		}
+		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
 	}
 
 	s.mu.Unlock()
@@ -633,13 +626,16 @@ func (s *Server) advanceCommitIndex() {
 			continue
 		}
 
-		s.debug(fmt.Sprintf("Applying %d\n", s.lastApplied))
 		log := s.log[s.lastApplied]
 
 		// Command == nil is a noop committed by the leader.
 		if log.Command != nil {
+			s.debug(fmt.Sprintf("Entry applied %d\n", s.lastApplied))
 			// TODO: what if Apply() takes too long?
 			res, err := s.statemachine.Apply(log.Command)
+
+			// Will be nil for follower logs and for no-op logs.
+			// Not nil for all user submitted messages.
 			if log.result != nil {
 				log.result <- applyResult{
 					res: res,
@@ -769,6 +765,7 @@ func (s *Server) Start() {
 				s.advanceCommitIndex()
 			case followerState:
 				s.timeout()
+				s.advanceCommitIndex()
 			case candidateState:
 				s.timeout()
 				s.becomeLeader()

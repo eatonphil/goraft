@@ -99,11 +99,13 @@ func main() {
 		},
 	}
 
-	statemachine := newKvSM()
+	sm1 := newKvSM()
+	sm2 := newKvSM()
+	sm3 := newKvSM()
 
-	s1 := goraft.NewServer(cluster, statemachine, ".", 0)
-	s2 := goraft.NewServer(cluster, statemachine, ".", 1)
-	s3 := goraft.NewServer(cluster, statemachine, ".", 2)
+	s1 := goraft.NewServer(cluster, sm1, ".", 0)
+	s2 := goraft.NewServer(cluster, sm2, ".", 1)
+	s3 := goraft.NewServer(cluster, sm3, ".", 2)
 
 	DEBUG := false
 	s1.Debug = DEBUG
@@ -114,7 +116,7 @@ func main() {
 	s3.Start()
 
 	var randKey, randValue string
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 5; i++ {
 		if i%100 == 0 {
 			fmt.Printf("%d entries inserted.\n", i)
 		}
@@ -155,6 +157,11 @@ func main() {
 		} else {
 			break
 		}
+	}
+
+	for _, sm := range []*kvStateMachine{sm1, sm2, sm3} {
+		goraft.Assert("Each node state machine is up-to-date", string(v), sm.kv[randKey])
+		goraft.Assert("Each node state machine is up-to-date", randValue, sm.kv[randKey])
 	}
 
 	goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)

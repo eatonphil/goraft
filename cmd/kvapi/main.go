@@ -18,7 +18,8 @@ import (
 )
 
 type statemachine struct {
-	db *sync.Map
+	db     *sync.Map
+	server int
 }
 
 type Command struct {
@@ -33,6 +34,8 @@ func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	fmt.Printf("\n\nAPPLYING for %d\n\n", s.server)
 
 	switch c.Name {
 	case "set":
@@ -173,6 +176,7 @@ func main() {
 
 	var sm statemachine
 	sm.db = &db
+	sm.server = cfg.index
 
 	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
 	s.Debug = true
