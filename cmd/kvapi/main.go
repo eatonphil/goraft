@@ -49,10 +49,9 @@ type httpServer struct {
 	db   *sync.Map
 }
 
-//
 // Example:
-//   curl http://localhost:2020/set -d '{"key": "x", "value": "1"}' -X POST
 //
+//	curl http://localhost:2020/set -d '{"key": "x", "value": "1"}' -X POST
 func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var c Command

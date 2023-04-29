@@ -607,7 +607,7 @@ func (s *Server) advanceCommitIndex() {
 		}
 		for i := lastLogIndex; i > s.commitIndex; i-- {
 			// not `len(s.cluster)/2 + 1` since the leader already has the entry.
-			quorum := len(s.cluster)/2
+			quorum := len(s.cluster) / 2
 			for j := range s.cluster {
 				if quorum == 0 {
 					break
@@ -695,7 +695,6 @@ func (s *Server) becomeLeader() {
 	s.mu.Lock()
 
 	quorum := len(s.cluster)/2 + 1
-	//s.debug(fmt.Sprintf("Checking for quorum: %d", quorum))
 	for i := range s.cluster {
 		// Reset all other state while we're at it
 		s.cluster[i].nextIndex = uint64(len(s.log) + 1)
