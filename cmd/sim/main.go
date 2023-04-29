@@ -1,11 +1,14 @@
 package main
 
-import "encoding/binary"
-import "fmt"
-import "sync"
-import "math/rand"
+import (
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
 
-import "github.com/eatonphil/goraft"
+	"github.com/eatonphil/goraft"
+)
 
 type kvStateMachine struct {
 	mu sync.Mutex
@@ -84,15 +87,15 @@ func main() {
 	cluster := []goraft.ClusterMember{
 		{
 			Id:      "0",
-			Address: ":2020",
+			Address: "localhost:2020",
 		},
 		{
 			Id:      "1",
-			Address: ":2021",
+			Address: "localhost:2021",
 		},
 		{
 			Id:      "2",
-			Address: ":2022",
+			Address: "localhost:2022",
 		},
 	}
 
@@ -102,7 +105,7 @@ func main() {
 	s2 := goraft.NewServer(cluster, statemachine, ".", 1)
 	s3 := goraft.NewServer(cluster, statemachine, ".", 2)
 
-	DEBUG := true
+	DEBUG := false
 	s1.Debug = DEBUG
 	s1.Start()
 	s2.Debug = DEBUG
@@ -111,7 +114,10 @@ func main() {
 	s3.Start()
 
 	var randKey, randValue string
-	for i := 0; i < 1; i++ {
+	for i := 0; i < 200; i++ {
+		if i % 100 == 0 {
+			fmt.Printf("%d entries inserted.\n", i)
+		}
 		key := randomString()
 		value := randomString()
 
@@ -132,6 +138,7 @@ func main() {
 					break foundALeader
 				}
 			}
+			time.Sleep(time.Second)
 		}
 
 		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)

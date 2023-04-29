@@ -2,15 +2,17 @@ package main
 
 import (
 	"bytes"
+	crypto "crypto/rand"
 	"encoding/json"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/eatonphil/goraft"
 )
@@ -156,22 +158,17 @@ func getConfig() config {
 		log.Fatal("Missing required parameter: --cluster $node1Id,$node1Address;...;$nodeNId,$nodeNAddress")
 	}
 
-	var clusterExceptCurrent []goraft.ClusterMember
-	for i, cluster := range cfg.cluster {
-		if i == cfg.index {
-			cfg.id = cluster.Id
-			cfg.address = cluster.Address
-			continue
-		}
-
-		clusterExceptCurrent = append(clusterExceptCurrent, cluster)
-	}
-	cfg.cluster = clusterExceptCurrent
-
 	return cfg
 }
 
 func main() {
+	var b [8]byte
+	_, err := crypto.Read(b[:])
+	if err != nil {
+		panic("cannot seed math/rand package with cryptographically secure random number generator")
+	}
+	rand.Seed(int64(binary.LittleEndian.Uint64(b[:])))
+
 	cfg := getConfig()
 
 	var db sync.Map
@@ -179,12 +176,16 @@ func main() {
 	var sm statemachine
 	sm.db = &db
 
-	s := goraft.NewServer(cfg.id, cfg.address, time.Second*2, cfg.cluster, &sm, "metadata")
+	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
+	s.Debug = true
 	go s.Start()
 
 	hs := httpServer{s, &db}
 
 	http.HandleFunc("/set", hs.setHandler)
 	http.HandleFunc("/get", hs.getHandler)
-	http.ListenAndServe(cfg.http, nil)
+	err = http.ListenAndServe(cfg.http, nil)
+	if err != nil {
+		panic(err)
+	}
 }
