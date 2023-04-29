@@ -12,6 +12,15 @@ Things that are missing:
 * Rigged up to Jepsen
 * Surely much else
 
+## Simulator
+
+Not particularly aggressive yet but does some minimal testing.
+
+```console
+$ cd cmd/sim
+$ go run main.go
+```
+
 # Distributed Key-Value Store API
 
 Try out the builtin distributed key-value API.
@@ -51,15 +60,6 @@ To get a key:
 
 ```console
 $ curl -v http://localhost:2021/get\?key\=y
-```
-
-## Simulator
-
-Not particularly aggressive yet but does some minimal testing.
-
-```console
-$ cd cmd/sim
-$ go run main.go
 ```
 
 # References

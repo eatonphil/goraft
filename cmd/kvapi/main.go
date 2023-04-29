@@ -35,8 +35,6 @@ func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	fmt.Printf("\n\nAPPLYING for %d\n\n", s.server)
-
 	switch c.Name {
 	case "set":
 		s.db.Store(c.Data["key"], c.Data["value"])

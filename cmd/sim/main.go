@@ -116,7 +116,7 @@ func main() {
 	s3.Start()
 
 	var randKey, randValue string
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 1_000; i++ {
 		if i%100 == 0 {
 			fmt.Printf("%d entries inserted.\n", i)
 		}
