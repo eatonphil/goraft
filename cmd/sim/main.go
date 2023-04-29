@@ -115,7 +115,7 @@ func main() {
 
 	var randKey, randValue string
 	for i := 0; i < 200; i++ {
-		if i % 100 == 0 {
+		if i%100 == 0 {
 			fmt.Printf("%d entries inserted.\n", i)
 		}
 		key := randomString()

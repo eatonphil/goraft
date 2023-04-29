@@ -220,7 +220,7 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	sync.Opts.DeadlockTimeout = 50*time.Millisecond
+	sync.Opts.DeadlockTimeout = 50 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
@@ -458,7 +458,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	}
 
 	s.log = append(s.log, req.Entries...)
-	Assert("Log contains new entries", len(s.log), int(logLen) + len(req.Entries))
+	Assert("Log contains new entries", len(s.log), int(logLen)+len(req.Entries))
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, logLen-1)
 
@@ -543,7 +543,7 @@ func (s *Server) appendEntries() {
 			var logBegin uint64
 			var entries []Entry
 			if s.cluster[i].nextIndex > lenLog-1 {
-				prevLogIndex = s.cluster[i].nextIndex-1
+				prevLogIndex = s.cluster[i].nextIndex - 1
 				prevLogTerm = s.log[prevLogIndex].Term
 				logBegin = prevLogIndex + 1
 			}
@@ -553,7 +553,7 @@ func (s *Server) appendEntries() {
 			lenEntries := uint64(len(entries))
 			req := AppendEntriesRequest{
 				RPCMessage: RPCMessage{
-					Term: s.currentTerm,	
+					Term: s.currentTerm,
 				},
 				LeaderId:     s.cluster[s.clusterIndex].Id,
 				PrevLogIndex: prevLogIndex,
@@ -586,7 +586,7 @@ func (s *Server) appendEntries() {
 			if rsp.Success {
 				prev := s.cluster[i].nextIndex
 				s.cluster[i].nextIndex = req.PrevLogIndex + lenEntries
-				s.cluster[i].matchIndex = s.cluster[i].nextIndex-1
+				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
 				s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex))
 			} else {
 				s.cluster[i].nextIndex = min(s.cluster[i].nextIndex, 1)
@@ -721,7 +721,6 @@ func (s *Server) becomeLeader() {
 
 func (s *Server) heartbeat() {
 	s.mu.Lock()
-
 
 	do := time.Now().After(s.heartbeatTimeout)
 	if do {
