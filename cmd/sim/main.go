@@ -103,12 +103,12 @@ func main() {
 	s3 := goraft.NewServer(cluster, statemachine, ".", 2)
 
 	DEBUG := true
-	s1.Start()
 	s1.Debug = DEBUG
-	s2.Start()
+	s1.Start()
 	s2.Debug = DEBUG
-	s3.Start()
+	s2.Start()
 	s3.Debug = DEBUG
+	s3.Start()
 
 	var randKey, randValue string
 	for i := 0; i < 1; i++ {

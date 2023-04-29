@@ -196,7 +196,7 @@ func max[T ~int | ~uint64](a, b T) T {
 }
 
 func (s *Server) debugmsg(msg string) string {
-	return fmt.Sprintf("%s [Id: %s, Term: %d] %s", time.Now().Format(time.RFC3339), s.id, s.currentTerm, msg)
+	return fmt.Sprintf("%s [Id: %s, Term: %d] %s", time.Now().Format(time.RFC3339Nano), s.id, s.currentTerm, msg)
 }
 
 func (s *Server) debug(msg string) {
@@ -215,11 +215,18 @@ func Server_assert[T comparable](s *Server, msg string, a, b T) {
 }
 
 func NewServer(
-	cluster []ClusterMember,
+	clusterConfig []ClusterMember,
 	statemachine StateMachine,
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
+	// Explicitly make a copy of the cluster because we'll be
+	// modifying it in this server.
+	var cluster []ClusterMember
+	for _, c := range clusterConfig {
+		cluster = append(cluster, c)
+	}
+
 	s := &Server{
 		id:           cluster[clusterIndex].Id,
 		address:      cluster[clusterIndex].Address,
@@ -227,7 +234,8 @@ func NewServer(
 		statemachine: statemachine,
 		metadataDir:  metadataDir,
 		clusterIndex: clusterIndex,
-		heartbeatMs:  500,
+		heartbeatMs:  300,
+		mu:           sync.Mutex{},
 	}
 	s.state = followerState
 	return s
@@ -265,7 +273,7 @@ func (s *Server) restore() {
 	if err != nil {
 		// Always must be one log entry
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			s.log = []Entry{{}}
+			s.log = []Entry{}
 		} else {
 			panic(err)
 		}
@@ -286,41 +294,53 @@ func (s *Server) requestVote() {
 			continue
 		}
 
-		go func(server *ClusterMember) {
+		go func(i int) {
 			s.mu.Lock()
 
 			// Skip if vote already requested
-			if server.voted {
+			if s.cluster[i].voted {
 				s.mu.Unlock()
 				return
 			}
-			server.voted = true
+			s.debug("Requesting vote from " + s.cluster[i].Id + ".")
+			s.cluster[i].voted = true
+
+			var lastLogIndex, lastLogTerm uint64
+			if len(s.log) > 0 {
+				lastLogIndex = uint64(len(s.log) - 1)
+				lastLogTerm = s.log[len(s.log)-1].Term
+			}
 
 			req := RequestVoteRequest{
 				RPCMessage: RPCMessage{
 					Term: s.currentTerm,
 				},
 				CandidateId:  s.id,
-				LastLogIndex: uint64(len(s.log) - 1),
-				LastLogTerm:  s.log[len(s.log)-1].Term,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
 			}
 			s.mu.Unlock()
 
 			var rsp RequestVoteResponse
-			ok := s.rpcCall(server, "Server.HandleRequestVoteRequest", req, &rsp)
+			ok := s.rpcCall(i, "Server.HandleRequestVoteRequest", req, &rsp)
 			if !ok {
 				// Will retry later
 				return
 			}
+			s.updateTerm(rsp.RPCMessage)
 
 			s.mu.Lock()
+			defer s.mu.Unlock()
 			dropStaleResponse := rsp.Term < s.currentTerm
-			if rsp.VoteGranted && !dropStaleResponse {
-				s.debug(fmt.Sprintf("Vote granted by %s", server.Id))
-				server.votedFor = s.id
+			if dropStaleResponse {
+				return
 			}
-			s.mu.Unlock()
-		}(&s.cluster[i])
+
+			if rsp.VoteGranted {
+				s.debug(fmt.Sprintf("Vote granted by %s", s.cluster[i].Id))
+				s.cluster[i].votedFor = s.id
+			}
+		}(i)
 	}
 }
 
@@ -328,29 +348,42 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 	s.updateTerm(req.RPCMessage)
 
 	s.mu.Lock()
+	s.debug("Received vote request from " + req.CandidateId + ".")
 
 	rsp.VoteGranted = false
 	rsp.Term = s.currentTerm
 
 	var grant bool
 	if req.Term < s.currentTerm {
+		s.debug("Not granting vote request from " + req.CandidateId + ".")
 		Server_assert(s, "VoteGranted = false", rsp.VoteGranted, false)
 	} else {
-		logOk := req.LastLogTerm > s.log[len(s.log)-1].Term ||
-			(req.LastLogTerm == s.log[len(s.log)-1].Term && req.LastLogIndex >= uint64(len(s.log)-1))
+		var lastLogTerm, logLen uint64
+		if len(s.log) > 0 {
+			lastLogTerm = s.log[len(s.log)-1].Term
+			logLen = uint64(len(s.log) - 1)
+		}
+		logOk := req.LastLogTerm > lastLogTerm ||
+			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
 		grant = req.Term == s.currentTerm &&
 			logOk &&
 			(s.votedFor == "" || s.votedFor == req.CandidateId)
 		if grant {
-			s.debug(fmt.Sprintf("Voted for %s for term %d", req.CandidateId, s.currentTerm))
+			s.debug(fmt.Sprintf("Voted for %s.", req.CandidateId))
 			s.votedFor = req.CandidateId
 			rsp.VoteGranted = true
+		} else {
+			s.debug(fmt.Sprintf("req.LastLogTerm: %d, lastLogTerm: %d", req.LastLogTerm, lastLogTerm))
+			s.debug(fmt.Sprintf("lastLogIndex: %d, myLastLogIndex: %d", req.LastLogIndex, len(s.log)-1))
+			s.debug(fmt.Sprintf("logOk: %t, votedFor: %s", logOk, s.votedFor))
+			s.debug("Not granting vote request from " + req.CandidateId + ".")
 		}
 	}
 
 	s.mu.Unlock()
 
 	if grant {
+		s.resetElectionTimeout()
 		s.persist()
 	}
 
@@ -371,6 +404,7 @@ func (s *Server) updateTerm(msg RPCMessage) {
 	s.mu.Unlock()
 
 	if persist {
+		s.resetElectionTimeout()
 		s.persist()
 	}
 }
@@ -387,23 +421,22 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	rsp.Term = s.currentTerm
 	rsp.Success = false
 
-	logLen := uint64(len(s.log))
-
-	validPreviousLog := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm
-
-	if req.Term < s.currentTerm || !validPreviousLog {
+	if req.Term < s.currentTerm {
 		s.mu.Unlock()
+		// Not a valid leader.
 		return nil
 	}
 
 	s.mu.Unlock()
 
+	// Valid leader so reset election.
 	s.resetElectionTimeout()
 
 	s.mu.Lock()
 
-	if len(req.Entries) == 0 {
-		rsp.Success = true
+	logLen := uint64(len(s.log))
+	validPreviousLog := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm
+	if !validPreviousLog {
 		s.mu.Unlock()
 		return nil
 	}
@@ -458,16 +491,19 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	return result.res, result.err
 }
 
-func (s *Server) rpcCall(c *ClusterMember, name string, req, rsp any) bool {
+func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	s.mu.Lock()
+	c := s.cluster[i]
 	var err error
+	var rpcClient *rpc.Client = c.rpcClient
 	if c.rpcClient == nil {
 		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
+		rpcClient = c.rpcClient
 	}
 	s.mu.Unlock()
 
 	if err == nil {
-		err = c.rpcClient.Call(name, req, rsp)
+		err = rpcClient.Call(name, req, rsp)
 	}
 
 	if err != nil {
@@ -479,7 +515,10 @@ func (s *Server) rpcCall(c *ClusterMember, name string, req, rsp any) bool {
 
 func (s *Server) appendEntries() {
 	s.mu.Lock()
-	lastLogIndex := uint64(len(s.log) - 1)
+	var lastLogIndex uint64
+	if len(s.log) > 0 {
+		lastLogIndex = uint64(len(s.log) - 1)
+	}
 	s.mu.Unlock()
 
 	for i := range s.cluster {
@@ -488,75 +527,95 @@ func (s *Server) appendEntries() {
 			continue
 		}
 
-		go func(server *ClusterMember) {
+		go func(i int) {
 			s.mu.Lock()
 			timeForHeartbeat := time.Now().After(s.heartbeatTimeout)
-			if lastLogIndex < server.matchIndex && !timeForHeartbeat {
+			if lastLogIndex < s.cluster[i].nextIndex && !timeForHeartbeat {
 				s.mu.Unlock()
 				return
 			}
 
 			s.heartbeatTimeout = time.Now().Add(time.Duration(s.heartbeatMs) * time.Millisecond)
 
+			var prevLogIndex, prevLogTerm uint64
 			var entries []Entry
-			if server.nextIndex < lastLogIndex {
-				entries = s.log[server.nextIndex : lastLogIndex+1]
+			if s.cluster[i].nextIndex == 1 {
+				prevLogIndex = 0
+				prevLogTerm = 0
+				entries = nil
+			} else {
+				prevLogIndex = s.cluster[i].nextIndex - 1
+				prevLogTerm = s.log[s.cluster[i].nextIndex-1].Term
+				entries = s.log[min(s.cluster[i].nextIndex, uint64(len(s.log))) : lastLogIndex+1]
 			}
+
+			lenEntries := uint64(len(entries))
 			req := AppendEntriesRequest{
 				LeaderId:     s.cluster[s.clusterIndex].Id,
-				PrevLogIndex: server.nextIndex - 1,
-				PrevLogTerm:  s.log[server.nextIndex-1].Term,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
 				Entries:      entries,
 				LeaderCommit: s.commitIndex,
+			}
+
+			if !timeForHeartbeat {
+				fmt.Println(s.cluster[i].Id, s.cluster[i].nextIndex, lenEntries, lastLogIndex, "here2")
+				Server_assert(s, "Sending at least one entry", len(entries) > 0, true)
 			}
 
 			s.mu.Unlock()
 
 			var rsp AppendEntriesResponse
-			ok := s.rpcCall(server, "Server.HandleAppendEntriesRequest", req, &rsp)
+			s.debug(fmt.Sprintf("Sending %d entries to %s.", len(entries), s.cluster[i].Id))
+			ok := s.rpcCall(i, "Server.HandleAppendEntriesRequest", req, &rsp)
 			if !ok {
 				// Will retry later
 				return
 			}
+			s.updateTerm(rsp.RPCMessage)
 
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			dropStaleResponse := rsp.Term < s.currentTerm
-			if rsp.Success && !dropStaleResponse {
-				prev := server.nextIndex
-				server.nextIndex = lastLogIndex + 1
-				server.matchIndex = lastLogIndex + 1
-				s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", server.Id, prev, server.nextIndex))
+			if dropStaleResponse {
 				return
-			} else {
-				server.nextIndex = max(server.nextIndex-1, 1)
-				fmt.Println(server.nextIndex)
-				s.debug(fmt.Sprintf("Forced to go back to %d for: %s\n", server.nextIndex, server.Id))
 			}
-		}(&s.cluster[i])
+
+			if rsp.Success {
+				prev := s.cluster[i].nextIndex
+				s.cluster[i].nextIndex = req.PrevLogIndex + lenEntries + 1
+				s.cluster[i].matchIndex = req.PrevLogIndex + lenEntries
+				s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex))
+			} else {
+				s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
+				s.debug(fmt.Sprintf("Forced to go back to %d for: %s\n", s.cluster[i].nextIndex, s.cluster[i].Id))
+			}
+		}(i)
 	}
 }
 
 func (s *Server) advanceCommitIndex() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	for i := uint64(len(s.log) - 1); i > s.commitIndex; i-- {
-		quorum := len(s.cluster)/2 + 1
-		for _, server := range s.cluster {
+	// Leader can update commitIndex on quorum.
+	if s.state == leaderState {
+		for i := uint64(len(s.log) - 2); i > s.commitIndex; i-- {
+			quorum := len(s.cluster)/2 + 1
+			for j := range s.cluster {
+				if quorum == 0 {
+					break
+				}
+
+				if s.cluster[j].matchIndex >= i {
+					quorum--
+				}
+			}
+
 			if quorum == 0 {
+				s.commitIndex = i
+				s.debug(fmt.Sprintf("New commit index: %d", i))
 				break
 			}
-
-			if server.matchIndex >= i {
-				quorum--
-			}
-		}
-
-		if quorum == 0 {
-			s.commitIndex = i
-			s.debug(fmt.Sprintf("New commit index: %d", i))
-			break
 		}
 	}
 
@@ -580,6 +639,8 @@ func (s *Server) advanceCommitIndex() {
 
 		s.lastApplied++
 	}
+
+	s.mu.Unlock()
 }
 
 func (s *Server) resetElectionTimeout() {
@@ -587,7 +648,8 @@ func (s *Server) resetElectionTimeout() {
 	defer s.mu.Unlock()
 
 	// Random timeout between 150-300ms (by default)
-	interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
+	interval := time.Duration(rand.Intn(s.heartbeatMs) + s.heartbeatMs)
+	s.debug(fmt.Sprintf("New interval: %s", interval*time.Millisecond))
 	s.electionTimeout = time.Now().Add(interval * time.Millisecond)
 }
 
@@ -596,15 +658,17 @@ func (s *Server) timeout() {
 
 	hasTimedOut := time.Now().After(s.electionTimeout)
 	if hasTimedOut {
-		s.debug("Timed out, starting new election")
+		s.debug("Timed out, starting new election.")
 		s.state = candidateState
 		s.currentTerm++
 		s.votedFor = s.id
 		for i := range s.cluster {
 			if i == s.clusterIndex {
 				s.cluster[i].votedFor = s.id
+				s.cluster[i].voted = true
 			} else {
 				s.cluster[i].votedFor = ""
+				s.cluster[i].voted = false
 			}
 		}
 	}
@@ -613,27 +677,22 @@ func (s *Server) timeout() {
 	if hasTimedOut {
 		s.resetElectionTimeout()
 		s.persist()
+		s.requestVote()
 	}
-
-	s.requestVote()
 }
 
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	quorum := len(s.cluster)/2 + 1
+	//s.debug(fmt.Sprintf("Checking for quorum: %d", quorum))
 	for i := range s.cluster {
-		if quorum == 0 {
-			break
-		}
+		// Reset all other state while we're at it
+		s.cluster[i].nextIndex = uint64(len(s.log) + 1)
+		s.cluster[i].matchIndex = 0
 
-		if s.cluster[i].votedFor == s.id {
+		if s.cluster[i].votedFor == s.id && quorum > 0 {
 			quorum--
-
-			// Reset all other state while we're at it
-			s.cluster[i].nextIndex = uint64(len(s.log))
-			s.cluster[i].matchIndex = 0
 		}
 	}
 
@@ -642,6 +701,8 @@ func (s *Server) becomeLeader() {
 		s.state = leaderState
 		s.heartbeatTimeout = time.Now()
 	}
+
+	s.mu.Unlock()
 }
 
 // Make sure rand is seeded
@@ -652,7 +713,6 @@ func (s *Server) Start() {
 		panic(err)
 	}
 	s.restore()
-	Server_assert(s, "At least one log entry", len(s.log) > 0, true)
 
 	rpcServer := rpc.NewServer()
 	rpcServer.Register(s)
@@ -666,6 +726,7 @@ func (s *Server) Start() {
 	go http.Serve(l, mux)
 
 	go func() {
+		s.resetElectionTimeout()
 		ticker := time.NewTicker(time.Millisecond)
 
 		for range ticker.C {
