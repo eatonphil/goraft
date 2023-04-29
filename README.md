@@ -4,6 +4,14 @@ A minimal implementation of Raft in Go.
 
 NOT FOR PRODUCTION USE.
 
+Things that are missing:
+
+* A half-decent persistence plan
+* Snapshotting/checkpointing and associated state transfer
+* Configuration change protocol
+* Rigged up to Jepsen
+* Surely much else
+
 # Distributed Key-Value Store API
 
 Try out the builtin distributed key-value API.
