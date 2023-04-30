@@ -672,6 +672,10 @@ func (s *Server) appendEntries(heartbeat bool) {
 			}
 
 			entries = s.log[logBegin:]
+			// Keep latency down by only applying N at a time.
+			if len(entries) > 50 {
+				entries = entries[:50]
+			}
 
 			lenEntries := uint64(len(entries))
 			req := AppendEntriesRequest{
