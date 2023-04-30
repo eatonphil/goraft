@@ -1,7 +1,8 @@
 package goraft
 
 import (
-	"encoding/gob"
+	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -45,7 +46,7 @@ type RequestVoteRequest struct {
 	RPCMessage
 
 	// Candidate requesting vote
-	CandidateId string
+	CandidateId uint64
 
 	// Index of candidate's last log entry
 	LastLogIndex uint64
@@ -65,7 +66,7 @@ type AppendEntriesRequest struct {
 	RPCMessage
 
 	// So follower can redirect clients
-	LeaderId string
+	LeaderId uint64
 
 	// Index of log entry immediately preceding new ones
 	PrevLogIndex uint64
@@ -88,7 +89,7 @@ type AppendEntriesResponse struct {
 }
 
 type ClusterMember struct {
-	Id      string
+	Id      uint64
 	Address string
 
 	// Index of the next log entry to send
@@ -96,7 +97,7 @@ type ClusterMember struct {
 	// Highest log entry known to be replicated
 	matchIndex uint64
 
-	votedFor string
+	votedFor uint64
 	voted    bool
 
 	// TCP connection
@@ -108,7 +109,7 @@ type PersistentState struct {
 	CurrentTerm uint64
 
 	// candidateId that received vote in current term (or null if none)
-	VotedFor string
+	VotedFor uint64
 
 	Log []Entry
 }
@@ -131,14 +132,14 @@ type Server struct {
 	currentTerm uint64
 
 	// Who was voted for
-	votedFor string
+	votedFor uint64
 
 	log []Entry
 
 	// ----------- READONLY STATE -----------
 
 	// Unique identifier for this Server
-	id string
+	id uint64
 
 	// The TCP address for RPC
 	address string
@@ -196,7 +197,7 @@ func max[T ~int | ~uint64](a, b T) T {
 }
 
 func (s *Server) debugmsg(msg string) string {
-	return fmt.Sprintf("%s [Id: %s, Term: %d] %s", time.Now().Format(time.RFC3339Nano), s.id, s.currentTerm, msg)
+	return fmt.Sprintf("%s [Id: %d, Term: %d] %s", time.Now().Format(time.RFC3339Nano), s.id, s.currentTerm, msg)
 }
 
 func (s *Server) debug(msg string) {
@@ -206,8 +207,20 @@ func (s *Server) debug(msg string) {
 	fmt.Println(s.debugmsg(msg))
 }
 
+func (s *Server) debugf(msg string, args ...any) {
+	if !s.Debug {
+		return
+	}
+
+	s.debug(fmt.Sprintf(msg, args...))
+}
+
 func (s *Server) warn(msg string) {
 	fmt.Println("[WARN] " + s.debugmsg(msg))
+}
+
+func (s *Server) warnf(msg string, args ...any) {
+	fmt.Println(fmt.Sprintf(msg, args...))
 }
 
 func Server_assert[T comparable](s *Server, msg string, a, b T) {
@@ -220,11 +233,14 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	sync.Opts.DeadlockTimeout = 50 * time.Millisecond
+	sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
 	for _, c := range clusterConfig {
+		if c.Id == 0 {
+			panic("Id must not be 0.")
+		}
 		cluster = append(cluster, c)
 	}
 
@@ -245,47 +261,163 @@ func NewServer(
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
 // that until the process restarts.
-func (s *Server) persist() {
+func (s *Server) persist(writeLogs bool, nNewLogs int) {
+	t := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.fd.Truncate(0)
+	if nNewLogs == 0 && writeLogs {
+		nNewLogs = len(s.log)
+	}
+
 	s.fd.Seek(0, 0)
-	enc := gob.NewEncoder(s.fd)
-	err := enc.Encode(PersistentState{
-		CurrentTerm: s.currentTerm,
-		Log:         s.log,
-		VotedFor:    s.votedFor,
-	})
+
+	bw := bufio.NewWriter(s.fd)
+	// Bytes 0  - 8:  Current term
+	// Bytes 8  - 24: Voted for
+	// Bytes 24 - 32: Log length
+	// Bytes 32 - N:  Log
+	err := binary.Write(bw, binary.LittleEndian, s.currentTerm)
 	if err != nil {
 		panic(err)
 	}
+
+	err = binary.Write(bw, binary.LittleEndian, s.votedFor)
+	if err != nil {
+		panic(err)
+	}
+
+	// Cast is important, want to write uint64 bytes.
+	err = binary.Write(bw, binary.LittleEndian, uint64(len(s.log)))
+	if err != nil {
+		panic(err)
+	}
+
+	if nNewLogs != len(s.log) {
+		// Flush because we're about to seek.
+		err := bw.Flush()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	newLogOffset := len(s.log) - nNewLogs
+
+	s.fd.Seek(int64(32+256*newLogOffset), 0)
+	bw = bufio.NewWriter(s.fd)
+
+	for i := newLogOffset; i < len(s.log); i++ {
+		// Bytes 0 - 8:    Entry term
+		// Bytes 8 - 16:   Entry command length
+		// Bytes 16 - 256: Entry command
+		err = binary.Write(bw, binary.LittleEndian, s.log[i].Term)
+		if err != nil {
+			panic(err)
+		}
+
+		if len(s.log[i].Command) > 240 {
+			panic("Command is too large. Must be at most 240 bytes.")
+		}
+
+		err = binary.Write(bw, binary.LittleEndian, uint64(len(s.log[i].Command)))
+		if err != nil {
+			panic(err)
+		}
+
+		written := 0
+		for written != len(s.log[i].Command) {
+			n, err := bw.Write(s.log[i].Command)
+			if err != nil {
+				panic(err)
+			}
+			written += n
+		}
+
+		// Pad out to 240 bytes.
+		for written < 240 {
+			written++
+			err := bw.WriteByte(0)
+			if err != nil {
+				panic(err)
+			}
+		}
+	}
+
+	if err = bw.Flush(); err != nil {
+		panic(err)
+	}
+
 	if err = s.fd.Sync(); err != nil {
 		panic(err)
 	}
-	s.debug(fmt.Sprintf("Persisted. Term: %d. Log Len: %d. Voted For: %s.", s.currentTerm, len(s.log), s.votedFor))
+	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewLogs, s.votedFor)
 }
 
 func (s *Server) restore() {
 	s.fd.Seek(0, 0)
-	dec := gob.NewDecoder(s.fd)
-	var p PersistentState
-	err := dec.Decode(&p)
+
+	br := bufio.NewReader(s.fd)
+	// Bytes 0  - 8:  Current term
+	// Bytes 8  - 24: Voted for
+	// Bytes 24 - 32: Log length
+	// Bytes 32 - N:  Log
+	err := binary.Read(br, binary.LittleEndian, &s.currentTerm)
+	// File hasn't been written yet.
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return
+	}
 	if err != nil {
-		// Always must be one log entry
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			s.log = []Entry{}
-		} else {
+		panic(err)
+	}
+
+	err = binary.Read(br, binary.LittleEndian, &s.votedFor)
+	if err != nil {
+		panic(err)
+	}
+
+	// Cast is important, want to write uint64 bytes.
+	var lenLog uint64
+	err = binary.Read(br, binary.LittleEndian, &lenLog)
+	if err != nil {
+		panic(err)
+	}
+
+	s.log = make([]Entry, lenLog)
+	var e Entry
+	for i := 0; i < len(s.log); i++ {
+		// Bytes 0 - 8:    Entry term
+		// Bytes 8 - 16:   Entry command length
+		// Bytes 16 - 256: Entry command
+		err = binary.Read(br, binary.LittleEndian, &e.Term)
+		if err != nil {
 			panic(err)
 		}
-	} else {
-		s.log = p.Log
-		for i := range s.cluster {
-			if i == s.clusterIndex {
-				s.votedFor = p.VotedFor
-			}
+
+		var len uint64
+		err = binary.Read(br, binary.LittleEndian, &len)
+		if err != nil {
+			panic(err)
 		}
-		s.currentTerm = p.CurrentTerm
+
+		var slot [240]byte
+		for i := 0; i < 240; i++ {
+			b, err := br.ReadByte()
+			if err != nil {
+				panic(err)
+			}
+			slot[i] = b
+		}
+
+		// Command may be smaller than slot size.
+		e.Command = slot[:len]
+
+		s.log[i] = e
+	}
+
+	for i := range s.cluster {
+		if i == s.clusterIndex {
+			s.cluster[i].votedFor = s.votedFor
+		}
 	}
 }
 
@@ -303,7 +435,7 @@ func (s *Server) requestVote() {
 				s.mu.Unlock()
 				return
 			}
-			s.debug("Requesting vote from " + s.cluster[i].Id + ".")
+			s.debugf("Requesting vote from %d.", s.cluster[i].Id)
 			s.cluster[i].voted = true
 
 			var lastLogIndex, lastLogTerm uint64
@@ -340,7 +472,7 @@ func (s *Server) requestVote() {
 			}
 
 			if rsp.VoteGranted {
-				s.debug(fmt.Sprintf("Vote granted by %s.", s.cluster[i].Id))
+				s.debugf("Vote granted by %d.", s.cluster[i].Id)
 				s.cluster[i].votedFor = s.id
 			}
 		}(i)
@@ -351,14 +483,14 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 	s.updateTerm(req.RPCMessage)
 
 	s.mu.Lock()
-	s.debug("Received vote request from " + req.CandidateId + ".")
+	s.debugf("Received vote request from %d.", req.CandidateId)
 
 	rsp.VoteGranted = false
 	rsp.Term = s.currentTerm
 
 	var grant bool
 	if req.Term < s.currentTerm {
-		s.debug("Not granting vote request from " + req.CandidateId + ".")
+		s.debugf("Not granting vote request from %d.", req.CandidateId)
 		Server_assert(s, "VoteGranted = false", rsp.VoteGranted, false)
 	} else {
 		var lastLogTerm, logLen uint64
@@ -370,16 +502,13 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
 		grant = req.Term == s.currentTerm &&
 			logOk &&
-			(s.votedFor == "" || s.votedFor == req.CandidateId)
+			(s.votedFor == 0 || s.votedFor == req.CandidateId)
 		if grant {
-			s.debug(fmt.Sprintf("Voted for %s.", req.CandidateId))
+			s.debugf("Voted for %d.", req.CandidateId)
 			s.votedFor = req.CandidateId
 			rsp.VoteGranted = true
 		} else {
-			s.debug(fmt.Sprintf("req.LastLogTerm: %d, lastLogTerm: %d", req.LastLogTerm, lastLogTerm))
-			s.debug(fmt.Sprintf("lastLogIndex: %d, myLastLogIndex: %d", req.LastLogIndex, len(s.log)-1))
-			s.debug(fmt.Sprintf("logOk: %t, votedFor: %s", logOk, s.votedFor))
-			s.debug("Not granting vote request from " + req.CandidateId + ".")
+			s.debugf("Not granting vote request from %d.", +req.CandidateId)
 		}
 	}
 
@@ -387,7 +516,7 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 
 	if grant {
 		s.resetElectionTimeout()
-		s.persist()
+		s.persist(false, 0)
 	}
 
 	return nil
@@ -400,7 +529,7 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 	if msg.Term > s.currentTerm {
 		s.currentTerm = msg.Term
 		s.state = followerState
-		s.votedFor = ""
+		s.votedFor = 0
 		transitioned = true
 		s.debug("Transitioned to follower")
 	}
@@ -408,7 +537,7 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 
 	if transitioned {
 		s.resetElectionTimeout()
-		s.persist()
+		s.persist(false, 0)
 	}
 	return transitioned
 }
@@ -426,7 +555,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	rsp.Success = false
 
 	if req.Term < s.currentTerm {
-		s.debug(fmt.Sprintf("Dropping request from old leader "+req.LeaderId+": term %d.", req.Term))
+		s.debugf("Dropping request from old leader %d: term %d.", req.LeaderId, req.Term)
 		s.mu.Unlock()
 		// Not a valid leader.
 		return nil
@@ -464,7 +593,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	}
 
 	s.mu.Unlock()
-	s.persist()
+	s.persist(len(req.Entries) != 0, len(req.Entries))
 
 	rsp.Success = true
 	return nil
@@ -487,9 +616,9 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		result:  resultChan,
 	})
 	s.mu.Unlock()
-	s.persist()
+	s.persist(true, 1)
 
-	s.appendEntries()
+	s.appendEntries(false)
 
 	// TODO: What happens if this takes too long?
 	s.debug("Waiting to be applied!")
@@ -513,13 +642,13 @@ func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	}
 
 	if err != nil {
-		s.warn(fmt.Sprintf("Error calling %s on %s: %s", name, c.Id, err))
+		s.warnf("Error calling %s on %d: %s.", name, c.Id, err)
 	}
 
 	return err == nil
 }
 
-func (s *Server) appendEntries() {
+func (s *Server) appendEntries(heartbeat bool) {
 	s.mu.Lock()
 	lenLog := uint64(len(s.log))
 	s.mu.Unlock()
@@ -535,6 +664,7 @@ func (s *Server) appendEntries() {
 			var prevLogIndex, prevLogTerm uint64
 			var logBegin uint64
 			var entries []Entry
+			// TODO: this is wrong. Sometimes it sends all entries even though that isn't necessary.
 			if s.cluster[i].nextIndex > lenLog-1 {
 				prevLogIndex = s.cluster[i].nextIndex - 1
 				prevLogTerm = s.log[prevLogIndex].Term
@@ -558,7 +688,7 @@ func (s *Server) appendEntries() {
 			s.mu.Unlock()
 
 			var rsp AppendEntriesResponse
-			s.debug(fmt.Sprintf("Sending %d entries to %s for term %d.", len(entries), s.cluster[i].Id, req.Term))
+			s.debugf("Sending %d entries to %d for term %d.", len(entries), s.cluster[i].Id, req.Term)
 			ok := s.rpcCall(i, "Server.HandleAppendEntriesRequest", req, &rsp)
 			if !ok {
 				// Will retry later
@@ -580,10 +710,10 @@ func (s *Server) appendEntries() {
 				prev := s.cluster[i].nextIndex
 				s.cluster[i].nextIndex = req.PrevLogIndex + lenEntries
 				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
-				s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex))
+				s.debugf("Message accepted for %d. Prev Index: %d Next Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex)
 			} else {
 				s.cluster[i].nextIndex = min(s.cluster[i].nextIndex, 1)
-				s.debug(fmt.Sprintf("Forced to go back to %d for: %s.", s.cluster[i].nextIndex, s.cluster[i].Id))
+				s.debugf("Forced to go back to %d for: %d.", s.cluster[i].nextIndex, s.cluster[i].Id)
 			}
 		}(i)
 	}
@@ -613,7 +743,7 @@ func (s *Server) advanceCommitIndex() {
 
 			if quorum == 0 {
 				s.commitIndex = i
-				s.debug(fmt.Sprintf("New commit index: %d", i))
+				s.debugf("New commit index: %d.", i)
 				break
 			}
 		}
@@ -630,7 +760,7 @@ func (s *Server) advanceCommitIndex() {
 
 		// Command == nil is a noop committed by the leader.
 		if log.Command != nil {
-			s.debug(fmt.Sprintf("Entry applied %d\n", s.lastApplied))
+			s.debugf("Entry applied: %d.", s.lastApplied)
 			// TODO: what if Apply() takes too long?
 			res, err := s.statemachine.Apply(log.Command)
 
@@ -655,7 +785,7 @@ func (s *Server) resetElectionTimeout() {
 	defer s.mu.Unlock()
 
 	interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
-	s.debug(fmt.Sprintf("New interval: %s", interval*time.Millisecond))
+	s.debugf("New interval: %s.", interval*time.Millisecond)
 	s.electionTimeout = time.Now().Add(interval * time.Millisecond)
 }
 
@@ -673,7 +803,7 @@ func (s *Server) timeout() {
 				s.cluster[i].votedFor = s.id
 				s.cluster[i].voted = true
 			} else {
-				s.cluster[i].votedFor = ""
+				s.cluster[i].votedFor = 0
 				s.cluster[i].voted = false
 			}
 		}
@@ -682,7 +812,7 @@ func (s *Server) timeout() {
 
 	if hasTimedOut {
 		s.resetElectionTimeout()
-		s.persist()
+		s.persist(false, 0)
 		s.requestVote()
 	}
 }
@@ -711,7 +841,7 @@ func (s *Server) becomeLeader() {
 	s.mu.Unlock()
 
 	if quorum == 0 {
-		s.persist()
+		s.persist(true, 1)
 	}
 }
 
@@ -726,14 +856,17 @@ func (s *Server) heartbeat() {
 	s.mu.Unlock()
 
 	if do {
-		s.appendEntries()
+		s.appendEntries(true)
 	}
 }
 
 // Make sure rand is seeded
 func (s *Server) Start() {
 	var err error
-	s.fd, err = os.OpenFile(path.Join(s.metadataDir, "md_"+s.id+".dat"), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
+	s.fd, err = os.OpenFile(
+		path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
+		os.O_SYNC|os.O_CREATE|os.O_RDWR,
+		0755)
 	if err != nil {
 		panic(err)
 	}

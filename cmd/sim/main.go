@@ -86,15 +86,15 @@ func main() {
 
 	cluster := []goraft.ClusterMember{
 		{
-			Id:      "0",
+			Id:      1,
 			Address: "localhost:2020",
 		},
 		{
-			Id:      "1",
+			Id:      2,
 			Address: "localhost:2021",
 		},
 		{
-			Id:      "2",
+			Id:      3,
 			Address: "localhost:2022",
 		},
 	}
@@ -107,7 +107,7 @@ func main() {
 	s2 := goraft.NewServer(cluster, sm2, ".", 1)
 	s3 := goraft.NewServer(cluster, sm3, ".", 2)
 
-	DEBUG := false
+	DEBUG := true
 	s1.Debug = DEBUG
 	s1.Start()
 	s2.Debug = DEBUG
@@ -116,9 +116,11 @@ func main() {
 	s3.Start()
 
 	var randKey, randValue string
+	t := time.Now()
 	for i := 0; i < 1_000; i++ {
-		if i%100 == 0 {
-			fmt.Printf("%d entries inserted.\n", i)
+		if i%100 == 0 && i > 0 {
+			fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
+			t = time.Now()
 		}
 		key := randomString()
 		value := randomString()
