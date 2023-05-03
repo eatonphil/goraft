@@ -265,13 +265,13 @@ const ENTRY_SIZE = PAGE_SIZE
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
 // that until the process restarts.
-func (s *Server) persist(writeLogs bool, nNewLogs int) {
+func (s *Server) persist(writeLog bool, nNewEntries int) {
 	t := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if nNewLogs == 0 && writeLogs {
-		nNewLogs = len(s.log)
+	if nNewEntries == 0 && writeLog {
+		nNewEntries = len(s.log)
 	}
 
 	s.fd.Seek(0, 0)
@@ -292,9 +292,9 @@ func (s *Server) persist(writeLogs bool, nNewLogs int) {
 	}
 	Server_assert(s, "Wrote full page", n, PAGE_SIZE)
 
-	if nNewLogs > 0 {
+	if writeLog && nNewEntries > 0 {
 
-		newLogOffset := max(len(s.log)-nNewLogs, 0)
+		newLogOffset := max(len(s.log)-nNewEntries, 0)
 
 		s.fd.Seek(int64(PAGE_SIZE+ENTRY_SIZE*newLogOffset), 0)
 
@@ -327,7 +327,7 @@ func (s *Server) persist(writeLogs bool, nNewLogs int) {
 	if err = s.fd.Sync(); err != nil {
 		panic(err)
 	}
-	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewLogs, s.votedFor)
+	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewEntries, s.votedFor)
 }
 
 func (s *Server) initialize() {
@@ -556,7 +556,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	}
 
 	next := req.PrevLogIndex + 1
-	nNewLogs := 0
+	nNewEntries := 0
 	for i := next; i < next+uint64(len(req.Entries)); i++ {
 		e := req.Entries[i-next]
 		if i >= uint64(len(s.log)) || s.log[i].Term != e.Term {
@@ -567,7 +567,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 		}
 
 		s.log[i] = e
-		nNewLogs++
+		nNewEntries++
 	}
 
 	if req.LeaderCommit > s.commitIndex {
@@ -575,7 +575,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	}
 
 	s.mu.Unlock()
-	s.persist(nNewLogs != 0, nNewLogs)
+	s.persist(nNewEntries != 0, nNewEntries)
 
 	rsp.Success = true
 	return nil
@@ -745,7 +745,7 @@ func (s *Server) advanceCommitIndex() {
 			// TODO: what if Apply() takes too long?
 			res, err := s.statemachine.Apply(log.Command)
 
-			// Will be nil for follower logs and for no-op logs.
+			// Will be nil for follower entries and for no-op entries.
 			// Not nil for all user submitted messages.
 			if log.result != nil {
 				log.result <- applyResult{
