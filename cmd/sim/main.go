@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pkg/profile"
 	"github.com/eatonphil/goraft"
 )
 
@@ -82,6 +83,7 @@ func randomString() string {
 }
 
 func main() {
+	defer profile.Start().Stop()
 	rand.Seed(0)
 
 	cluster := []goraft.ClusterMember{
