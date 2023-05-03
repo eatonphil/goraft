@@ -292,10 +292,9 @@ func (s *Server) persist(writeLogs bool, nNewLogs int) {
 	}
 	Server_assert(s, "Wrote full page", n, PAGE_SIZE)
 
-
 	if nNewLogs > 0 {
 
-		newLogOffset := max(len(s.log) - nNewLogs, 0)
+		newLogOffset := max(len(s.log)-nNewLogs, 0)
 
 		s.fd.Seek(int64(PAGE_SIZE+ENTRY_SIZE*newLogOffset), 0)
 
@@ -305,8 +304,8 @@ func (s *Server) persist(writeLogs bool, nNewLogs int) {
 			// Bytes 8 - 16:   Entry command length
 			// Bytes 16 - ENTRY_SIZE: Entry command
 
-			if len(s.log[i].Command) > ENTRY_SIZE - ENTRY_HEADER {
-				panic(fmt.Sprintf("Command is too large. Must be at most %d bytes.", ENTRY_SIZE - ENTRY_HEADER))
+			if len(s.log[i].Command) > ENTRY_SIZE-ENTRY_HEADER {
+				panic(fmt.Sprintf("Command is too large. Must be at most %d bytes.", ENTRY_SIZE-ENTRY_HEADER))
 			}
 
 			binary.LittleEndian.PutUint64(entryBytes[:8], s.log[i].Term)
@@ -347,7 +346,7 @@ func (s *Server) initialize() {
 func (s *Server) restore() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	if s.fd == nil {
 		var err error
 		s.fd, err = os.OpenFile(
@@ -397,7 +396,7 @@ func (s *Server) restore() {
 			// Bytes 16 - ENTRY_SIZE: Entry command
 			e.Term = binary.LittleEndian.Uint64(entryBytes[:8])
 			lenValue := binary.LittleEndian.Uint64(entryBytes[8:16])
-			e.Command = entryBytes[16:16 + lenValue]
+			e.Command = entryBytes[16 : 16+lenValue]
 			s.log[i] = e
 		}
 	}
@@ -558,11 +557,11 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 	next := req.PrevLogIndex + 1
 	nNewLogs := 0
-	for i := next; i < next + uint64(len(req.Entries)); i++ {
-		e := req.Entries[i - next]
+	for i := next; i < next+uint64(len(req.Entries)); i++ {
+		e := req.Entries[i-next]
 		if i >= uint64(len(s.log)) || s.log[i].Term != e.Term {
 			// Either allocate space for the whole thing, or truncate when terms mismatch.
-			newLog := make([]Entry, next + uint64(len(req.Entries)))
+			newLog := make([]Entry, next+uint64(len(req.Entries)))
 			copy(newLog, s.log)
 			s.log = newLog
 		}
@@ -653,7 +652,7 @@ func (s *Server) appendEntries() {
 
 			// Keep latency down by only applying N at a time.
 			if len(entries) > 50 {
-			 	entries = entries[:50]
+				entries = entries[:50]
 			}
 
 			lenEntries := uint64(len(entries))
@@ -691,8 +690,8 @@ func (s *Server) appendEntries() {
 
 			if rsp.Success {
 				prev := s.cluster[i].nextIndex
-				s.cluster[i].nextIndex = max(req.PrevLogIndex + lenEntries + 1, 1)
-				s.cluster[i].matchIndex = s.cluster[i].nextIndex-1
+				s.cluster[i].nextIndex = max(req.PrevLogIndex+lenEntries+1, 1)
+				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
 				s.debugf("Message accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
 			} else {
 				s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
