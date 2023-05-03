@@ -6,7 +6,6 @@ NOT FOR PRODUCTION USE.
 
 Things that are missing:
 
-* A half-decent persistence plan
 * Snapshotting/checkpointing and associated state transfer
 * Configuration change protocol
 * Rigged up to Jepsen
