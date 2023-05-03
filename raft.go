@@ -258,6 +258,10 @@ func NewServer(
 	return s
 }
 
+const PAGE_SIZE = 4096
+const ENTRY_HEADER = 16
+const ENTRY_SIZE = PAGE_SIZE
+
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
 // that until the process restarts.
@@ -272,74 +276,48 @@ func (s *Server) persist(writeLogs bool, nNewLogs int) {
 
 	s.fd.Seek(0, 0)
 
+	var page [PAGE_SIZE]byte
 	bw := bufio.NewWriter(s.fd)
-	// Bytes 0  - 8:  Current term
-	// Bytes 8  - 24: Voted for
-	// Bytes 24 - 32: Log length
-	// Bytes 32 - N:  Log
-	err := binary.Write(bw, binary.LittleEndian, s.currentTerm)
+	// Bytes 0  - 8:   Current term
+	// Bytes 8  - 16:  Voted for
+	// Bytes 16 - 24:  Log length
+	// Bytes 4096 - N: Log
+
+	binary.LittleEndian.PutUint64(page[:8], s.currentTerm)
+	binary.LittleEndian.PutUint64(page[8:16], s.votedFor)
+	binary.LittleEndian.PutUint64(page[16:24], uint64(len(s.log)))
+	n, err := s.fd.Write(page[:])
 	if err != nil {
 		panic(err)
 	}
+	Server_assert(s, "Wrote full page", n, PAGE_SIZE)
 
-	err = binary.Write(bw, binary.LittleEndian, s.votedFor)
-	if err != nil {
-		panic(err)
-	}
 
-	// Cast is important, want to write uint64 bytes.
-	err = binary.Write(bw, binary.LittleEndian, uint64(len(s.log)))
-	if err != nil {
-		panic(err)
-	}
+	if nNewLogs > 0 {
 
-	if nNewLogs != len(s.log) {
-		// Flush because we're about to seek.
-		err := bw.Flush()
-		if err != nil {
-			panic(err)
-		}
-	}
+		newLogOffset := max(len(s.log) - nNewLogs, 0)
 
-	newLogOffset := len(s.log) - nNewLogs
+		s.fd.Seek(int64(PAGE_SIZE+ENTRY_SIZE*newLogOffset), 0)
 
-	s.fd.Seek(int64(32+256*newLogOffset), 0)
-	bw = bufio.NewWriter(s.fd)
+		var entryBytes [ENTRY_SIZE]byte
+		for i := newLogOffset; i < len(s.log); i++ {
+			// Bytes 0 - 8:    Entry term
+			// Bytes 8 - 16:   Entry command length
+			// Bytes 16 - ENTRY_SIZE: Entry command
 
-	for i := newLogOffset; i < len(s.log); i++ {
-		// Bytes 0 - 8:    Entry term
-		// Bytes 8 - 16:   Entry command length
-		// Bytes 16 - 256: Entry command
-		err = binary.Write(bw, binary.LittleEndian, s.log[i].Term)
-		if err != nil {
-			panic(err)
-		}
+			if len(s.log[i].Command) > ENTRY_SIZE - ENTRY_HEADER {
+				panic(fmt.Sprintf("Command is too large. Must be at most %d bytes.", ENTRY_SIZE - ENTRY_HEADER))
+			}
 
-		if len(s.log[i].Command) > 240 {
-			panic("Command is too large. Must be at most 240 bytes.")
-		}
+			binary.LittleEndian.PutUint64(entryBytes[:8], s.log[i].Term)
+			binary.LittleEndian.PutUint64(entryBytes[8:16], uint64(len(s.log[i].Command)))
+			copy(entryBytes[16:], []byte(s.log[i].Command))
 
-		err = binary.Write(bw, binary.LittleEndian, uint64(len(s.log[i].Command)))
-		if err != nil {
-			panic(err)
-		}
-
-		written := 0
-		for written != len(s.log[i].Command) {
-			n, err := bw.Write(s.log[i].Command)
+			n, err := s.fd.Write(entryBytes[:])
 			if err != nil {
 				panic(err)
 			}
-			written += n
-		}
-
-		// Pad out to 240 bytes.
-		for written < 240 {
-			written++
-			err := bw.WriteByte(0)
-			if err != nil {
-				panic(err)
-			}
+			Server_assert(s, "Wrote full page", n, ENTRY_SIZE)
 		}
 	}
 
@@ -353,65 +331,10 @@ func (s *Server) persist(writeLogs bool, nNewLogs int) {
 	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewLogs, s.votedFor)
 }
 
-func (s *Server) restore() {
-	s.fd.Seek(0, 0)
-
-	br := bufio.NewReader(s.fd)
-	// Bytes 0  - 8:  Current term
-	// Bytes 8  - 24: Voted for
-	// Bytes 24 - 32: Log length
-	// Bytes 32 - N:  Log
-	err := binary.Read(br, binary.LittleEndian, &s.currentTerm)
-	// File hasn't been written yet.
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return
-	}
-	if err != nil {
-		panic(err)
-	}
-
-	err = binary.Read(br, binary.LittleEndian, &s.votedFor)
-	if err != nil {
-		panic(err)
-	}
-
-	// Cast is important, want to write uint64 bytes.
-	var lenLog uint64
-	err = binary.Read(br, binary.LittleEndian, &lenLog)
-	if err != nil {
-		panic(err)
-	}
-
-	s.log = make([]Entry, lenLog)
-	var e Entry
-	for i := 0; i < len(s.log); i++ {
-		// Bytes 0 - 8:    Entry term
-		// Bytes 8 - 16:   Entry command length
-		// Bytes 16 - 256: Entry command
-		err = binary.Read(br, binary.LittleEndian, &e.Term)
-		if err != nil {
-			panic(err)
-		}
-
-		var len uint64
-		err = binary.Read(br, binary.LittleEndian, &len)
-		if err != nil {
-			panic(err)
-		}
-
-		var slot [240]byte
-		for i := 0; i < 240; i++ {
-			b, err := br.ReadByte()
-			if err != nil {
-				panic(err)
-			}
-			slot[i] = b
-		}
-
-		// Command may be smaller than slot size.
-		e.Command = slot[:len]
-
-		s.log[i] = e
+func (s *Server) initialize() {
+	if len(s.log) == 0 {
+		// Always has at least one log entry.
+		s.log = []Entry{{}}
 	}
 
 	for i := range s.cluster {
@@ -419,6 +342,67 @@ func (s *Server) restore() {
 			s.cluster[i].votedFor = s.votedFor
 		}
 	}
+}
+
+func (s *Server) restore() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	if s.fd == nil {
+		var err error
+		s.fd, err = os.OpenFile(
+			path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
+			os.O_SYNC|os.O_CREATE|os.O_RDWR,
+			0755)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	s.fd.Seek(0, 0)
+
+	// Bytes 0  - 8:   Current term
+	// Bytes 8  - 16:  Voted for
+	// Bytes 16 - 24:  Log length
+	// Bytes 4096 - N: Log
+	var page [PAGE_SIZE]byte
+	n, err := s.fd.Read(page[:])
+	if err == io.EOF {
+		s.initialize()
+		return
+	} else if err != nil {
+		panic(err)
+	}
+	Server_assert(s, "Read full page", n, PAGE_SIZE)
+
+	s.currentTerm = binary.LittleEndian.Uint64(page[:8])
+	s.votedFor = binary.LittleEndian.Uint64(page[8:16])
+	lenLog := binary.LittleEndian.Uint64(page[16:24])
+
+	if lenLog > 0 {
+		s.fd.Seek(int64(PAGE_SIZE), 0)
+
+		s.log = make([]Entry, lenLog)
+		var e Entry
+		for i := 0; i < len(s.log); i++ {
+			var entryBytes [ENTRY_SIZE]byte
+			n, err := s.fd.Read(entryBytes[:])
+			if err != nil {
+				panic(err)
+			}
+			Server_assert(s, "Read full entry", n, ENTRY_SIZE)
+
+			// Bytes 0 - 8:    Entry term
+			// Bytes 8 - 16:   Entry command length
+			// Bytes 16 - ENTRY_SIZE: Entry command
+			e.Term = binary.LittleEndian.Uint64(entryBytes[:8])
+			lenValue := binary.LittleEndian.Uint64(entryBytes[8:16])
+			e.Command = entryBytes[16:16 + lenValue]
+			s.log[i] = e
+		}
+	}
+
+	s.initialize()
 }
 
 func (s *Server) requestVote() {
@@ -438,11 +422,8 @@ func (s *Server) requestVote() {
 			s.debugf("Requesting vote from %d.", s.cluster[i].Id)
 			s.cluster[i].voted = true
 
-			var lastLogIndex, lastLogTerm uint64
-			if len(s.log) > 0 {
-				lastLogIndex = uint64(len(s.log) - 1)
-				lastLogTerm = s.log[len(s.log)-1].Term
-			}
+			lastLogIndex := uint64(len(s.log) - 1)
+			lastLogTerm := s.log[len(s.log)-1].Term
 
 			req := RequestVoteRequest{
 				RPCMessage: RPCMessage{
@@ -493,11 +474,8 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 		s.debugf("Not granting vote request from %d.", req.CandidateId)
 		Server_assert(s, "VoteGranted = false", rsp.VoteGranted, false)
 	} else {
-		var lastLogTerm, logLen uint64
-		if len(s.log) > 0 {
-			lastLogTerm = s.log[len(s.log)-1].Term
-			logLen = uint64(len(s.log) - 1)
-		}
+		lastLogTerm := s.log[len(s.log)-1].Term
+		logLen := uint64(len(s.log) - 1)
 		logOk := req.LastLogTerm > lastLogTerm ||
 			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
 		grant = req.Term == s.currentTerm &&
@@ -569,7 +547,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	s.mu.Lock()
 
 	logLen := uint64(len(s.log))
-	validPreviousLog := req.PrevLogIndex == 0 ||
+	validPreviousLog := req.PrevLogIndex == 0 /* This is the induction step */ ||
 		(req.PrevLogIndex < logLen &&
 			s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
 	if !validPreviousLog {
@@ -578,22 +556,27 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 		return nil
 	}
 
-	validExistingEntry := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm
-	newEntry := req.PrevLogIndex >= logLen
-	if !validExistingEntry && !newEntry {
-		// Delete entry and all that follow it
-		s.log = s.log[:req.PrevLogIndex]
-		logLen = uint64(len(s.log))
+	next := req.PrevLogIndex + 1
+	nNewLogs := 0
+	for i := next; i < next + uint64(len(req.Entries)); i++ {
+		e := req.Entries[i - next]
+		if i >= uint64(len(s.log)) || s.log[i].Term != e.Term {
+			// Either allocate space for the whole thing, or truncate when terms mismatch.
+			newLog := make([]Entry, next + uint64(len(req.Entries)))
+			copy(newLog, s.log)
+			s.log = newLog
+		}
+
+		s.log[i] = e
+		nNewLogs++
 	}
 
-	s.log = append(s.log, req.Entries...)
-	Assert("Log contains new entries (if any)", len(s.log), int(logLen)+len(req.Entries))
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
 	}
 
 	s.mu.Unlock()
-	s.persist(len(req.Entries) != 0, len(req.Entries))
+	s.persist(nNewLogs != 0, nNewLogs)
 
 	rsp.Success = true
 	return nil
@@ -618,7 +601,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	s.mu.Unlock()
 	s.persist(true, 1)
 
-	s.appendEntries(false)
+	s.appendEntries()
 
 	// TODO: What happens if this takes too long?
 	s.debug("Waiting to be applied!")
@@ -648,11 +631,7 @@ func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	return err == nil
 }
 
-func (s *Server) appendEntries(heartbeat bool) {
-	s.mu.Lock()
-	lenLog := uint64(len(s.log))
-	s.mu.Unlock()
-
+func (s *Server) appendEntries() {
 	for i := range s.cluster {
 		// Don't need to send message to self
 		if i == s.clusterIndex {
@@ -661,20 +640,20 @@ func (s *Server) appendEntries(heartbeat bool) {
 
 		go func(i int) {
 			s.mu.Lock()
-			var prevLogIndex, prevLogTerm uint64
-			var logBegin uint64
+
+			next := s.cluster[i].nextIndex
+			prevLogIndex := next - 1
+			prevLogTerm := s.log[prevLogIndex].Term
+
 			var entries []Entry
-			// TODO: this is wrong. Sometimes it sends all entries even though that isn't necessary.
-			if s.cluster[i].nextIndex > lenLog-1 {
-				prevLogIndex = s.cluster[i].nextIndex - 1
-				prevLogTerm = s.log[prevLogIndex].Term
-				logBegin = prevLogIndex + 1
+			if uint64(len(s.log)-1) >= s.cluster[i].nextIndex {
+				s.debugf("len: %d, next: %d, server: %d", len(s.log), next, s.cluster[i].Id)
+				entries = s.log[next:]
 			}
 
-			entries = s.log[logBegin:]
 			// Keep latency down by only applying N at a time.
 			if len(entries) > 50 {
-				entries = entries[:50]
+			 	entries = entries[:50]
 			}
 
 			lenEntries := uint64(len(entries))
@@ -695,7 +674,7 @@ func (s *Server) appendEntries(heartbeat bool) {
 			s.debugf("Sending %d entries to %d for term %d.", len(entries), s.cluster[i].Id, req.Term)
 			ok := s.rpcCall(i, "Server.HandleAppendEntriesRequest", req, &rsp)
 			if !ok {
-				// Will retry later
+				// Will retry next tick
 				return
 			}
 
@@ -712,11 +691,11 @@ func (s *Server) appendEntries(heartbeat bool) {
 
 			if rsp.Success {
 				prev := s.cluster[i].nextIndex
-				s.cluster[i].nextIndex = req.PrevLogIndex + lenEntries
-				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
-				s.debugf("Message accepted for %d. Prev Index: %d Next Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex)
+				s.cluster[i].nextIndex = max(req.PrevLogIndex + lenEntries + 1, 1)
+				s.cluster[i].matchIndex = s.cluster[i].nextIndex-1
+				s.debugf("Message accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
 			} else {
-				s.cluster[i].nextIndex = min(s.cluster[i].nextIndex, 1)
+				s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
 				s.debugf("Forced to go back to %d for: %d.", s.cluster[i].nextIndex, s.cluster[i].Id)
 			}
 		}(i)
@@ -725,13 +704,12 @@ func (s *Server) appendEntries(heartbeat bool) {
 
 func (s *Server) advanceCommitIndex() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Leader can update commitIndex on quorum.
 	if s.state == leaderState {
-		var lastLogIndex uint64
-		if len(s.log) > 0 {
-			lastLogIndex = uint64(len(s.log) - 1)
-		}
+		lastLogIndex := uint64(len(s.log) - 1)
+
 		for i := lastLogIndex; i > s.commitIndex; i-- {
 			// not `len(s.cluster)/2 + 1` since the leader already has the entry.
 			quorum := len(s.cluster) / 2
@@ -753,11 +731,11 @@ func (s *Server) advanceCommitIndex() {
 		}
 	}
 
-	for s.lastApplied <= s.commitIndex {
+	if s.lastApplied <= s.commitIndex {
 		if s.lastApplied == 0 {
 			// First entry is always a blank one.
 			s.lastApplied++
-			continue
+			return
 		}
 
 		log := s.log[s.lastApplied]
@@ -780,8 +758,6 @@ func (s *Server) advanceCommitIndex() {
 
 		s.lastApplied++
 	}
-
-	s.mu.Unlock()
 }
 
 func (s *Server) resetElectionTimeout() {
@@ -852,28 +828,20 @@ func (s *Server) becomeLeader() {
 func (s *Server) heartbeat() {
 	s.mu.Lock()
 
-	do := time.Now().After(s.heartbeatTimeout)
-	if do {
+	timeForHeartbeat := time.Now().After(s.heartbeatTimeout)
+	if timeForHeartbeat {
 		s.heartbeatTimeout = time.Now().Add(time.Duration(s.heartbeatMs) * time.Millisecond)
 	}
 
 	s.mu.Unlock()
 
-	if do {
-		s.appendEntries(true)
+	if timeForHeartbeat {
+		s.appendEntries()
 	}
 }
 
 // Make sure rand is seeded
 func (s *Server) Start() {
-	var err error
-	s.fd, err = os.OpenFile(
-		path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
-		os.O_SYNC|os.O_CREATE|os.O_RDWR,
-		0755)
-	if err != nil {
-		panic(err)
-	}
 	s.restore()
 
 	rpcServer := rpc.NewServer()
