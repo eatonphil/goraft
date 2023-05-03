@@ -1,7 +1,8 @@
 package goraft
 
 import (
-	"encoding/gob"
+	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -45,7 +46,7 @@ type RequestVoteRequest struct {
 	RPCMessage
 
 	// Candidate requesting vote
-	CandidateId string
+	CandidateId uint64
 
 	// Index of candidate's last log entry
 	LastLogIndex uint64
@@ -65,7 +66,7 @@ type AppendEntriesRequest struct {
 	RPCMessage
 
 	// So follower can redirect clients
-	LeaderId string
+	LeaderId uint64
 
 	// Index of log entry immediately preceding new ones
 	PrevLogIndex uint64
@@ -88,7 +89,7 @@ type AppendEntriesResponse struct {
 }
 
 type ClusterMember struct {
-	Id      string
+	Id      uint64
 	Address string
 
 	// Index of the next log entry to send
@@ -96,7 +97,7 @@ type ClusterMember struct {
 	// Highest log entry known to be replicated
 	matchIndex uint64
 
-	votedFor string
+	votedFor uint64
 	voted    bool
 
 	// TCP connection
@@ -108,7 +109,7 @@ type PersistentState struct {
 	CurrentTerm uint64
 
 	// candidateId that received vote in current term (or null if none)
-	VotedFor string
+	VotedFor uint64
 
 	Log []Entry
 }
@@ -131,14 +132,14 @@ type Server struct {
 	currentTerm uint64
 
 	// Who was voted for
-	votedFor string
+	votedFor uint64
 
 	log []Entry
 
 	// ----------- READONLY STATE -----------
 
 	// Unique identifier for this Server
-	id string
+	id uint64
 
 	// The TCP address for RPC
 	address string
@@ -196,7 +197,7 @@ func max[T ~int | ~uint64](a, b T) T {
 }
 
 func (s *Server) debugmsg(msg string) string {
-	return fmt.Sprintf("%s [Id: %s, Term: %d] %s", time.Now().Format(time.RFC3339Nano), s.id, s.currentTerm, msg)
+	return fmt.Sprintf("%s [Id: %d, Term: %d] %s", time.Now().Format(time.RFC3339Nano), s.id, s.currentTerm, msg)
 }
 
 func (s *Server) debug(msg string) {
@@ -206,8 +207,20 @@ func (s *Server) debug(msg string) {
 	fmt.Println(s.debugmsg(msg))
 }
 
+func (s *Server) debugf(msg string, args ...any) {
+	if !s.Debug {
+		return
+	}
+
+	s.debug(fmt.Sprintf(msg, args...))
+}
+
 func (s *Server) warn(msg string) {
 	fmt.Println("[WARN] " + s.debugmsg(msg))
+}
+
+func (s *Server) warnf(msg string, args ...any) {
+	fmt.Println(fmt.Sprintf(msg, args...))
 }
 
 func Server_assert[T comparable](s *Server, msg string, a, b T) {
@@ -220,11 +233,14 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	sync.Opts.DeadlockTimeout = 50 * time.Millisecond
+	sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
 	for _, c := range clusterConfig {
+		if c.Id == 0 {
+			panic("Id must not be 0.")
+		}
 		cluster = append(cluster, c)
 	}
 
@@ -242,51 +258,150 @@ func NewServer(
 	return s
 }
 
+const PAGE_SIZE = 4096
+const ENTRY_HEADER = 16
+const ENTRY_SIZE = PAGE_SIZE
+
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
 // that until the process restarts.
-func (s *Server) persist() {
+func (s *Server) persist(writeLogs bool, nNewLogs int) {
+	t := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.fd.Truncate(0)
+	if nNewLogs == 0 && writeLogs {
+		nNewLogs = len(s.log)
+	}
+
 	s.fd.Seek(0, 0)
-	enc := gob.NewEncoder(s.fd)
-	err := enc.Encode(PersistentState{
-		CurrentTerm: s.currentTerm,
-		Log:         s.log,
-		VotedFor:    s.votedFor,
-	})
+
+	var page [PAGE_SIZE]byte
+	bw := bufio.NewWriter(s.fd)
+	// Bytes 0  - 8:   Current term
+	// Bytes 8  - 16:  Voted for
+	// Bytes 16 - 24:  Log length
+	// Bytes 4096 - N: Log
+
+	binary.LittleEndian.PutUint64(page[:8], s.currentTerm)
+	binary.LittleEndian.PutUint64(page[8:16], s.votedFor)
+	binary.LittleEndian.PutUint64(page[16:24], uint64(len(s.log)))
+	n, err := s.fd.Write(page[:])
 	if err != nil {
 		panic(err)
 	}
+	Server_assert(s, "Wrote full page", n, PAGE_SIZE)
+
+	if nNewLogs > 0 {
+
+		newLogOffset := max(len(s.log)-nNewLogs, 0)
+
+		s.fd.Seek(int64(PAGE_SIZE+ENTRY_SIZE*newLogOffset), 0)
+
+		var entryBytes [ENTRY_SIZE]byte
+		for i := newLogOffset; i < len(s.log); i++ {
+			// Bytes 0 - 8:    Entry term
+			// Bytes 8 - 16:   Entry command length
+			// Bytes 16 - ENTRY_SIZE: Entry command
+
+			if len(s.log[i].Command) > ENTRY_SIZE-ENTRY_HEADER {
+				panic(fmt.Sprintf("Command is too large. Must be at most %d bytes.", ENTRY_SIZE-ENTRY_HEADER))
+			}
+
+			binary.LittleEndian.PutUint64(entryBytes[:8], s.log[i].Term)
+			binary.LittleEndian.PutUint64(entryBytes[8:16], uint64(len(s.log[i].Command)))
+			copy(entryBytes[16:], []byte(s.log[i].Command))
+
+			n, err := s.fd.Write(entryBytes[:])
+			if err != nil {
+				panic(err)
+			}
+			Server_assert(s, "Wrote full page", n, ENTRY_SIZE)
+		}
+	}
+
+	if err = bw.Flush(); err != nil {
+		panic(err)
+	}
+
 	if err = s.fd.Sync(); err != nil {
 		panic(err)
 	}
-	s.debug(fmt.Sprintf("Persisted. Term: %d. Log Len: %d. Voted For: %s.", s.currentTerm, len(s.log), s.votedFor))
+	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewLogs, s.votedFor)
+}
+
+func (s *Server) initialize() {
+	if len(s.log) == 0 {
+		// Always has at least one log entry.
+		s.log = []Entry{{}}
+	}
+
+	for i := range s.cluster {
+		if i == s.clusterIndex {
+			s.cluster[i].votedFor = s.votedFor
+		}
+	}
 }
 
 func (s *Server) restore() {
-	s.fd.Seek(0, 0)
-	dec := gob.NewDecoder(s.fd)
-	var p PersistentState
-	err := dec.Decode(&p)
-	if err != nil {
-		// Always must be one log entry
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			s.log = []Entry{}
-		} else {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.fd == nil {
+		var err error
+		s.fd, err = os.OpenFile(
+			path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
+			os.O_SYNC|os.O_CREATE|os.O_RDWR,
+			0755)
+		if err != nil {
 			panic(err)
 		}
-	} else {
-		s.log = p.Log
-		for i := range s.cluster {
-			if i == s.clusterIndex {
-				s.votedFor = p.VotedFor
-			}
-		}
-		s.currentTerm = p.CurrentTerm
 	}
+
+	s.fd.Seek(0, 0)
+
+	// Bytes 0  - 8:   Current term
+	// Bytes 8  - 16:  Voted for
+	// Bytes 16 - 24:  Log length
+	// Bytes 4096 - N: Log
+	var page [PAGE_SIZE]byte
+	n, err := s.fd.Read(page[:])
+	if err == io.EOF {
+		s.initialize()
+		return
+	} else if err != nil {
+		panic(err)
+	}
+	Server_assert(s, "Read full page", n, PAGE_SIZE)
+
+	s.currentTerm = binary.LittleEndian.Uint64(page[:8])
+	s.votedFor = binary.LittleEndian.Uint64(page[8:16])
+	lenLog := binary.LittleEndian.Uint64(page[16:24])
+
+	if lenLog > 0 {
+		s.fd.Seek(int64(PAGE_SIZE), 0)
+
+		s.log = make([]Entry, lenLog)
+		var e Entry
+		for i := 0; i < len(s.log); i++ {
+			var entryBytes [ENTRY_SIZE]byte
+			n, err := s.fd.Read(entryBytes[:])
+			if err != nil {
+				panic(err)
+			}
+			Server_assert(s, "Read full entry", n, ENTRY_SIZE)
+
+			// Bytes 0 - 8:    Entry term
+			// Bytes 8 - 16:   Entry command length
+			// Bytes 16 - ENTRY_SIZE: Entry command
+			e.Term = binary.LittleEndian.Uint64(entryBytes[:8])
+			lenValue := binary.LittleEndian.Uint64(entryBytes[8:16])
+			e.Command = entryBytes[16 : 16+lenValue]
+			s.log[i] = e
+		}
+	}
+
+	s.initialize()
 }
 
 func (s *Server) requestVote() {
@@ -303,14 +418,11 @@ func (s *Server) requestVote() {
 				s.mu.Unlock()
 				return
 			}
-			s.debug("Requesting vote from " + s.cluster[i].Id + ".")
+			s.debugf("Requesting vote from %d.", s.cluster[i].Id)
 			s.cluster[i].voted = true
 
-			var lastLogIndex, lastLogTerm uint64
-			if len(s.log) > 0 {
-				lastLogIndex = uint64(len(s.log) - 1)
-				lastLogTerm = s.log[len(s.log)-1].Term
-			}
+			lastLogIndex := uint64(len(s.log) - 1)
+			lastLogTerm := s.log[len(s.log)-1].Term
 
 			req := RequestVoteRequest{
 				RPCMessage: RPCMessage{
@@ -340,7 +452,7 @@ func (s *Server) requestVote() {
 			}
 
 			if rsp.VoteGranted {
-				s.debug(fmt.Sprintf("Vote granted by %s.", s.cluster[i].Id))
+				s.debugf("Vote granted by %d.", s.cluster[i].Id)
 				s.cluster[i].votedFor = s.id
 			}
 		}(i)
@@ -351,35 +463,29 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 	s.updateTerm(req.RPCMessage)
 
 	s.mu.Lock()
-	s.debug("Received vote request from " + req.CandidateId + ".")
+	s.debugf("Received vote request from %d.", req.CandidateId)
 
 	rsp.VoteGranted = false
 	rsp.Term = s.currentTerm
 
 	var grant bool
 	if req.Term < s.currentTerm {
-		s.debug("Not granting vote request from " + req.CandidateId + ".")
+		s.debugf("Not granting vote request from %d.", req.CandidateId)
 		Server_assert(s, "VoteGranted = false", rsp.VoteGranted, false)
 	} else {
-		var lastLogTerm, logLen uint64
-		if len(s.log) > 0 {
-			lastLogTerm = s.log[len(s.log)-1].Term
-			logLen = uint64(len(s.log) - 1)
-		}
+		lastLogTerm := s.log[len(s.log)-1].Term
+		logLen := uint64(len(s.log) - 1)
 		logOk := req.LastLogTerm > lastLogTerm ||
 			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
 		grant = req.Term == s.currentTerm &&
 			logOk &&
-			(s.votedFor == "" || s.votedFor == req.CandidateId)
+			(s.votedFor == 0 || s.votedFor == req.CandidateId)
 		if grant {
-			s.debug(fmt.Sprintf("Voted for %s.", req.CandidateId))
+			s.debugf("Voted for %d.", req.CandidateId)
 			s.votedFor = req.CandidateId
 			rsp.VoteGranted = true
 		} else {
-			s.debug(fmt.Sprintf("req.LastLogTerm: %d, lastLogTerm: %d", req.LastLogTerm, lastLogTerm))
-			s.debug(fmt.Sprintf("lastLogIndex: %d, myLastLogIndex: %d", req.LastLogIndex, len(s.log)-1))
-			s.debug(fmt.Sprintf("logOk: %t, votedFor: %s", logOk, s.votedFor))
-			s.debug("Not granting vote request from " + req.CandidateId + ".")
+			s.debugf("Not granting vote request from %d.", +req.CandidateId)
 		}
 	}
 
@@ -387,7 +493,7 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 
 	if grant {
 		s.resetElectionTimeout()
-		s.persist()
+		s.persist(false, 0)
 	}
 
 	return nil
@@ -400,7 +506,7 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 	if msg.Term > s.currentTerm {
 		s.currentTerm = msg.Term
 		s.state = followerState
-		s.votedFor = ""
+		s.votedFor = 0
 		transitioned = true
 		s.debug("Transitioned to follower")
 	}
@@ -408,7 +514,7 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 
 	if transitioned {
 		s.resetElectionTimeout()
-		s.persist()
+		s.persist(false, 0)
 	}
 	return transitioned
 }
@@ -426,7 +532,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	rsp.Success = false
 
 	if req.Term < s.currentTerm {
-		s.debug(fmt.Sprintf("Dropping request from old leader "+req.LeaderId+": term %d.", req.Term))
+		s.debugf("Dropping request from old leader %d: term %d.", req.LeaderId, req.Term)
 		s.mu.Unlock()
 		// Not a valid leader.
 		return nil
@@ -440,7 +546,7 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	s.mu.Lock()
 
 	logLen := uint64(len(s.log))
-	validPreviousLog := req.PrevLogIndex == 0 ||
+	validPreviousLog := req.PrevLogIndex == 0 /* This is the induction step */ ||
 		(req.PrevLogIndex < logLen &&
 			s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
 	if !validPreviousLog {
@@ -449,22 +555,27 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 		return nil
 	}
 
-	validExistingEntry := req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm
-	newEntry := req.PrevLogIndex >= logLen
-	if !validExistingEntry && !newEntry {
-		// Delete entry and all that follow it
-		s.log = s.log[:req.PrevLogIndex]
-		logLen = uint64(len(s.log))
+	next := req.PrevLogIndex + 1
+	nNewLogs := 0
+	for i := next; i < next+uint64(len(req.Entries)); i++ {
+		e := req.Entries[i-next]
+		if i >= uint64(len(s.log)) || s.log[i].Term != e.Term {
+			// Either allocate space for the whole thing, or truncate when terms mismatch.
+			newLog := make([]Entry, next+uint64(len(req.Entries)))
+			copy(newLog, s.log)
+			s.log = newLog
+		}
+
+		s.log[i] = e
+		nNewLogs++
 	}
 
-	s.log = append(s.log, req.Entries...)
-	Assert("Log contains new entries (if any)", len(s.log), int(logLen)+len(req.Entries))
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
 	}
 
 	s.mu.Unlock()
-	s.persist()
+	s.persist(nNewLogs != 0, nNewLogs)
 
 	rsp.Success = true
 	return nil
@@ -487,7 +598,7 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 		result:  resultChan,
 	})
 	s.mu.Unlock()
-	s.persist()
+	s.persist(true, 1)
 
 	s.appendEntries()
 
@@ -513,17 +624,13 @@ func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	}
 
 	if err != nil {
-		s.warn(fmt.Sprintf("Error calling %s on %s: %s", name, c.Id, err))
+		s.warnf("Error calling %s on %d: %s.", name, c.Id, err)
 	}
 
 	return err == nil
 }
 
 func (s *Server) appendEntries() {
-	s.mu.Lock()
-	lenLog := uint64(len(s.log))
-	s.mu.Unlock()
-
 	for i := range s.cluster {
 		// Don't need to send message to self
 		if i == s.clusterIndex {
@@ -532,16 +639,21 @@ func (s *Server) appendEntries() {
 
 		go func(i int) {
 			s.mu.Lock()
-			var prevLogIndex, prevLogTerm uint64
-			var logBegin uint64
+
+			next := s.cluster[i].nextIndex
+			prevLogIndex := next - 1
+			prevLogTerm := s.log[prevLogIndex].Term
+
 			var entries []Entry
-			if s.cluster[i].nextIndex > lenLog-1 {
-				prevLogIndex = s.cluster[i].nextIndex - 1
-				prevLogTerm = s.log[prevLogIndex].Term
-				logBegin = prevLogIndex + 1
+			if uint64(len(s.log)-1) >= s.cluster[i].nextIndex {
+				s.debugf("len: %d, next: %d, server: %d", len(s.log), next, s.cluster[i].Id)
+				entries = s.log[next:]
 			}
 
-			entries = s.log[logBegin:]
+			// Keep latency down by only applying N at a time.
+			if len(entries) > 50 {
+				entries = entries[:50]
+			}
 
 			lenEntries := uint64(len(entries))
 			req := AppendEntriesRequest{
@@ -558,10 +670,10 @@ func (s *Server) appendEntries() {
 			s.mu.Unlock()
 
 			var rsp AppendEntriesResponse
-			s.debug(fmt.Sprintf("Sending %d entries to %s for term %d.", len(entries), s.cluster[i].Id, req.Term))
+			s.debugf("Sending %d entries to %d for term %d.", len(entries), s.cluster[i].Id, req.Term)
 			ok := s.rpcCall(i, "Server.HandleAppendEntriesRequest", req, &rsp)
 			if !ok {
-				// Will retry later
+				// Will retry next tick
 				return
 			}
 
@@ -578,12 +690,12 @@ func (s *Server) appendEntries() {
 
 			if rsp.Success {
 				prev := s.cluster[i].nextIndex
-				s.cluster[i].nextIndex = req.PrevLogIndex + lenEntries
+				s.cluster[i].nextIndex = max(req.PrevLogIndex+lenEntries+1, 1)
 				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
-				s.debug(fmt.Sprintf("Message accepted for %s. Prev Index: %d Next Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex))
+				s.debugf("Message accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
 			} else {
-				s.cluster[i].nextIndex = min(s.cluster[i].nextIndex, 1)
-				s.debug(fmt.Sprintf("Forced to go back to %d for: %s.", s.cluster[i].nextIndex, s.cluster[i].Id))
+				s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
+				s.debugf("Forced to go back to %d for: %d.", s.cluster[i].nextIndex, s.cluster[i].Id)
 			}
 		}(i)
 	}
@@ -591,13 +703,12 @@ func (s *Server) appendEntries() {
 
 func (s *Server) advanceCommitIndex() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Leader can update commitIndex on quorum.
 	if s.state == leaderState {
-		var lastLogIndex uint64
-		if len(s.log) > 0 {
-			lastLogIndex = uint64(len(s.log) - 1)
-		}
+		lastLogIndex := uint64(len(s.log) - 1)
+
 		for i := lastLogIndex; i > s.commitIndex; i-- {
 			// not `len(s.cluster)/2 + 1` since the leader already has the entry.
 			quorum := len(s.cluster) / 2
@@ -613,24 +724,24 @@ func (s *Server) advanceCommitIndex() {
 
 			if quorum == 0 {
 				s.commitIndex = i
-				s.debug(fmt.Sprintf("New commit index: %d", i))
+				s.debugf("New commit index: %d.", i)
 				break
 			}
 		}
 	}
 
-	for s.lastApplied <= s.commitIndex {
+	if s.lastApplied <= s.commitIndex {
 		if s.lastApplied == 0 {
 			// First entry is always a blank one.
 			s.lastApplied++
-			continue
+			return
 		}
 
 		log := s.log[s.lastApplied]
 
 		// Command == nil is a noop committed by the leader.
 		if log.Command != nil {
-			s.debug(fmt.Sprintf("Entry applied %d\n", s.lastApplied))
+			s.debugf("Entry applied: %d.", s.lastApplied)
 			// TODO: what if Apply() takes too long?
 			res, err := s.statemachine.Apply(log.Command)
 
@@ -646,8 +757,6 @@ func (s *Server) advanceCommitIndex() {
 
 		s.lastApplied++
 	}
-
-	s.mu.Unlock()
 }
 
 func (s *Server) resetElectionTimeout() {
@@ -655,7 +764,7 @@ func (s *Server) resetElectionTimeout() {
 	defer s.mu.Unlock()
 
 	interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
-	s.debug(fmt.Sprintf("New interval: %s", interval*time.Millisecond))
+	s.debugf("New interval: %s.", interval*time.Millisecond)
 	s.electionTimeout = time.Now().Add(interval * time.Millisecond)
 }
 
@@ -673,7 +782,7 @@ func (s *Server) timeout() {
 				s.cluster[i].votedFor = s.id
 				s.cluster[i].voted = true
 			} else {
-				s.cluster[i].votedFor = ""
+				s.cluster[i].votedFor = 0
 				s.cluster[i].voted = false
 			}
 		}
@@ -682,7 +791,7 @@ func (s *Server) timeout() {
 
 	if hasTimedOut {
 		s.resetElectionTimeout()
-		s.persist()
+		s.persist(false, 0)
 		s.requestVote()
 	}
 }
@@ -711,32 +820,27 @@ func (s *Server) becomeLeader() {
 	s.mu.Unlock()
 
 	if quorum == 0 {
-		s.persist()
+		s.persist(true, 1)
 	}
 }
 
 func (s *Server) heartbeat() {
 	s.mu.Lock()
 
-	do := time.Now().After(s.heartbeatTimeout)
-	if do {
+	timeForHeartbeat := time.Now().After(s.heartbeatTimeout)
+	if timeForHeartbeat {
 		s.heartbeatTimeout = time.Now().Add(time.Duration(s.heartbeatMs) * time.Millisecond)
 	}
 
 	s.mu.Unlock()
 
-	if do {
+	if timeForHeartbeat {
 		s.appendEntries()
 	}
 }
 
 // Make sure rand is seeded
 func (s *Server) Start() {
-	var err error
-	s.fd, err = os.OpenFile(path.Join(s.metadataDir, "md_"+s.id+".dat"), os.O_SYNC|os.O_CREATE|os.O_RDWR, 0755)
-	if err != nil {
-		panic(err)
-	}
 	s.restore()
 
 	rpcServer := rpc.NewServer()

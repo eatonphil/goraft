@@ -86,15 +86,15 @@ func main() {
 
 	cluster := []goraft.ClusterMember{
 		{
-			Id:      "0",
+			Id:      1,
 			Address: "localhost:2020",
 		},
 		{
-			Id:      "1",
+			Id:      2,
 			Address: "localhost:2021",
 		},
 		{
-			Id:      "2",
+			Id:      3,
 			Address: "localhost:2022",
 		},
 	}
@@ -115,10 +115,27 @@ func main() {
 	s3.Debug = DEBUG
 	s3.Start()
 
+outer:
+	for {
+		for _, s := range []*goraft.Server{s1, s2, s3} {
+			if s.IsLeader() {
+				break outer
+			}
+		}
+
+		fmt.Println("Waiting for a leader.")
+		time.Sleep(time.Second)
+	}
+
+	N_ENTRIES := 3_000
+
 	var randKey, randValue string
-	for i := 0; i < 1_000; i++ {
-		if i%100 == 0 {
-			fmt.Printf("%d entries inserted.\n", i)
+	t := time.Now()
+	total := time.Now()
+	for i := 0; i < N_ENTRIES; i++ {
+		if i%1000 == 0 && i > 0 {
+			fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
+			t = time.Now()
 		}
 		key := randomString()
 		value := randomString()
@@ -145,6 +162,7 @@ func main() {
 
 		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
 	}
+	fmt.Printf("Total time: %s. Average insert/second: %s.\n", time.Now().Sub(total), time.Now().Sub(total)/time.Duration(N_ENTRIES))
 
 	var v []byte
 	var err error
@@ -159,6 +177,9 @@ func main() {
 		}
 	}
 
+	// Ooph, but need to wait for the other state machines to catch up.
+	time.Sleep(2 * time.Second)
+
 	for _, sm := range []*kvStateMachine{sm1, sm2, sm3} {
 		goraft.Assert("Each node state machine is up-to-date", string(v), sm.kv[randKey])
 		goraft.Assert("Each node state machine is up-to-date", randValue, sm.kv[randKey])
@@ -168,30 +189,3 @@ func main() {
 
 	fmt.Printf("%s = %s, expected: %s\n", randKey, string(v), randValue)
 }
-
-/*
-	  OLD
-
-	   _, err := s1.Apply(kvsmMessage_Set("a", "1"))
-	if err != nil {
-		panic(err)
-	}
-	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
-	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
-
-	_, err = s1.Apply(kvsmMessage_Set("b", "2"))
-	if err != nil {
-		panic(err)
-	}
-	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
-	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
-
-	v, err := s1.Apply(kvsmMessage_Get("a"))
-	if err != nil {
-		panic(err)
-	}
-	goraft.Assert("s1.Entries() == s2.Entries()", s1.Entries() == s2.Entries(), true)
-	goraft.Assert("s1.Entries() == s3.Entries()", s1.Entries() == s3.Entries(), true)
-
-
-*/
