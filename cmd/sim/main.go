@@ -130,7 +130,7 @@ outer:
 	}
 
 	N_CLIENTS := 1
-	N_ENTRIES := 10_000 / N_CLIENTS
+	N_ENTRIES := 100_000 / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
@@ -192,7 +192,12 @@ outer:
 	wg.Wait()
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/float64(total/time.Second))
 
-	goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
+	for _, s := range []*goraft.Server{s1, s2, s3} {
+		for !s.AllCommitted() {
+			time.Sleep(time.Second)
+			fmt.Println("Waiting for commits to be applied.")
+		}
+	}
 
 	var v []byte
 	for _, s := range []*goraft.Server{s1, s2, s3} {
@@ -207,15 +212,10 @@ outer:
 		}
 	}
 
-	// Ooph, but need to wait for the other state machines to catch up.
-	time.Sleep(2 * time.Second)
-
 	for _, sm := range []*kvStateMachine{sm1, sm2, sm3} {
 		goraft.Assert("Each node state machine is up-to-date", string(v), sm.kv[randKey])
 		goraft.Assert("Each node state machine is up-to-date", randValue, sm.kv[randKey])
 	}
-
-	goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
 
 	fmt.Printf("%s = %s, expected: %s\n", randKey, string(v), randValue)
 }

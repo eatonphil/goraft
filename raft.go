@@ -260,7 +260,7 @@ func NewServer(
 
 const PAGE_SIZE = 4096
 const ENTRY_HEADER = 16
-const ENTRY_SIZE = 256
+const ENTRY_SIZE = PAGE_SIZE
 
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
@@ -912,9 +912,18 @@ func (s *Server) IsLeader() bool {
 	return s.state == leaderState
 }
 
-func (s *Server) Entries() int {
+// Excludes heartbeat entries
+func (s *Server) AllCommitted() bool {
 	s.mu.Lock()
-	e := len(s.log)
-	s.mu.Unlock()
-	return e
+	defer s.mu.Unlock()
+
+	for i := len(s.log)-1; i >= 0; i-- {
+		e := s.log[i]
+		// Last entry in the log that is applied by the user.
+		if len(e.Command) > 0 {
+			return s.lastApplied >= uint64(i)
+		}
+	}
+
+	return true
 }
