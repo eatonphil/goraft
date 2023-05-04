@@ -260,7 +260,7 @@ func NewServer(
 
 const PAGE_SIZE = 4096
 const ENTRY_HEADER = 16
-const ENTRY_SIZE = 1024
+const ENTRY_SIZE = 256
 
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
@@ -583,6 +583,8 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 var ErrApplyToLeader = errors.New("Cannot apply message to follower, apply to leader.")
 
+var lastApply = time.Now()
+
 func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	s.mu.Lock()
 	if s.state != leaderState {
@@ -603,7 +605,16 @@ func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	s.mu.Unlock()
 	s.persist(true, 1)
 
-	s.appendEntries()
+	go func () {
+		delay := 3*time.Millisecond
+		time.Sleep(delay)
+		s.mu.Lock()
+		if time.Now().Sub(lastApply) > delay {
+			s.appendEntries()
+			lastApply = time.Now()
+		}
+		s.mu.Unlock()
+	}()
 
 	// TODO: What happens if this takes too long?
 	s.debug("Waiting to be applied!")

@@ -129,55 +129,70 @@ outer:
 		time.Sleep(time.Second)
 	}
 
-	N_ENTRIES := 100_000
-	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH
+	N_CLIENTS := 1
+	N_ENTRIES := 10_000 / N_CLIENTS
+	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
+	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
+	var wg sync.WaitGroup
+	wg.Add(N_CLIENTS)
 	var randKey, randValue string
-	//t := time.Now()
 	var total time.Duration
-	var entries [][]byte
-	for i := 0; i < N_ENTRIES; i++ {
-		// if i%1000 == 0 && i > 0 {
-		// 	fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
-		// 	t = time.Now()
-		// }
-		key := randomString()
-		value := randomString()
+	var mu sync.Mutex
+	for j := 0; j < N_CLIENTS; j++ {
+		go func(j int) {
+			defer wg.Done()
 
-		if rand.Intn(100) > 90 || i == 0 {
-			randKey = key
-			randValue = value
-		}
+			//t := time.Now()
+			var entries [][]byte
+			for i := 0; i < N_ENTRIES; i++ {
+				// if i%1000 == 0 && i > 0 {
+				// 	fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
+				// 	t = time.Now()
+				// }
+				key := randomString()
+				value := randomString()
 
-		entries = append(entries, kvsmMessage_Set(key, value))
-
-		if len(entries) < BATCH_SIZE && i < N_ENTRIES-1 {
-			continue
-		}
-	foundALeader:
-		for {
-			for _, s := range []*goraft.Server{s1, s2, s3} {
-				t := time.Now()
-				_, err := s.Apply(entries)
-				if err == goraft.ErrApplyToLeader {
-					continue
-				} else if err != nil {
-					panic(err)
-				} else {
-					diff := time.Now().Sub(t)
-					total += diff
-					fmt.Printf("%d entries inserted in %s.\n", len(entries), diff)
-					break foundALeader
+				if rand.Intn(100) > 90 || i == 0 && j == 0 {
+					randKey = key
+					randValue = value
 				}
+
+				entries = append(entries, kvsmMessage_Set(key, value))
+
+				if len(entries) < BATCH_SIZE && i < N_ENTRIES-1 {
+					continue
+				}
+			foundALeader:
+				for {
+					for _, s := range []*goraft.Server{s1, s2, s3} {
+						t := time.Now()
+						_, err := s.Apply(entries)
+						if err == goraft.ErrApplyToLeader {
+							continue
+						} else if err != nil {
+							panic(err)
+						} else {
+							diff := time.Now().Sub(t)
+							mu.Lock()
+							total += diff
+							mu.Unlock()
+							fmt.Printf("Client: %d. %d entries inserted in %s.\n", j, len(entries), diff)
+							break foundALeader
+						}
+					}
+					time.Sleep(time.Second)
+				}
+
+				entries = [][]byte{}
 			}
-			time.Sleep(time.Second)
-		}
-
-		entries = [][]byte{}
-
-		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
+		}(j)
 	}
+
+	wg.Wait()
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/float64(total/time.Second))
+
+	goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
 
 	var v []byte
 	for _, s := range []*goraft.Server{s1, s2, s3} {
