@@ -177,7 +177,15 @@ outer:
 							mu.Lock()
 							total += diff
 							mu.Unlock()
-							fmt.Printf("Client: %d. %d entries inserted in %s.\n", j, len(entries), diff)
+							fmt.Printf("Client: %d. %d entries (%d of %d: %d%%) inserted. Latency: %s. Throughput: %f entries/s.\n",
+								j,
+								len(entries),
+								i+1,
+								N_ENTRIES,
+								(i+1)/N_ENTRIES,
+								diff,
+								float64(len(entries)) / float64(diff / time.Second),
+							)
 							break foundALeader
 						}
 					}
