@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/profile"
 	"github.com/eatonphil/goraft"
+	"github.com/pkg/profile"
 )
 
 type kvStateMachine struct {
@@ -129,16 +129,18 @@ outer:
 		time.Sleep(time.Second)
 	}
 
-	N_ENTRIES := 3_000
+	N_ENTRIES := 100_000
+	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH
 
 	var randKey, randValue string
-	t := time.Now()
+	//t := time.Now()
 	var total time.Duration
+	var entries [][]byte
 	for i := 0; i < N_ENTRIES; i++ {
-		if i%1000 == 0 && i > 0 {
-			fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
-			t = time.Now()
-		}
+		// if i%1000 == 0 && i > 0 {
+		// 	fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
+		// 	t = time.Now()
+		// }
 		key := randomString()
 		value := randomString()
 
@@ -147,36 +149,45 @@ outer:
 			randValue = value
 		}
 
+		entries = append(entries, kvsmMessage_Set(key, value))
+
+		if len(entries) < BATCH_SIZE && i < N_ENTRIES-1 {
+			continue
+		}
 	foundALeader:
 		for {
 			for _, s := range []*goraft.Server{s1, s2, s3} {
 				t := time.Now()
-				_, err := s.Apply(kvsmMessage_Set(key, value))
-				total += time.Now().Sub(t)
+				_, err := s.Apply(entries)
 				if err == goraft.ErrApplyToLeader {
 					continue
 				} else if err != nil {
 					panic(err)
 				} else {
+					diff := time.Now().Sub(t)
+					total += diff
+					fmt.Printf("%d entries inserted in %s.\n", len(entries), diff)
 					break foundALeader
 				}
 			}
 			time.Sleep(time.Second)
 		}
 
+		entries = [][]byte{}
+
 		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
 	}
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/float64(total/time.Second))
 
 	var v []byte
-	var err error
 	for _, s := range []*goraft.Server{s1, s2, s3} {
-		v, err = s.Apply(kvsmMessage_Get(randKey))
+		res, err := s.Apply([][]byte{kvsmMessage_Get(randKey)})
 		if err == goraft.ErrApplyToLeader {
 			continue
 		} else if err != nil {
 			panic(err)
 		} else {
+			v = res[0].Result
 			break
 		}
 	}
