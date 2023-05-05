@@ -131,7 +131,7 @@ outer:
 
 	var randKey, randValue string
 	t := time.Now()
-	total := time.Now()
+	var total time.Duration
 	for i := 0; i < N_ENTRIES; i++ {
 		if i%1000 == 0 && i > 0 {
 			fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
@@ -148,7 +148,9 @@ outer:
 	foundALeader:
 		for {
 			for _, s := range []*goraft.Server{s1, s2, s3} {
+				t := time.Now()
 				_, err := s.Apply(kvsmMessage_Set(key, value))
+				total += time.Now().Sub(t)
 				if err == goraft.ErrApplyToLeader {
 					continue
 				} else if err != nil {
@@ -162,7 +164,7 @@ outer:
 
 		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
 	}
-	fmt.Printf("Total time: %s. Average insert/second: %s.\n", time.Now().Sub(total), time.Now().Sub(total)/time.Duration(N_ENTRIES))
+	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/float64(total/time.Second))
 
 	var v []byte
 	var err error
