@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/eatonphil/goraft"
-	"github.com/pkg/profile"
+	// "github.com/pkg/profile"
 )
 
 type kvStateMachine struct {
@@ -83,7 +83,7 @@ func randomString() string {
 }
 
 func main() {
-	defer profile.Start().Stop()
+	//defer profile.Start(profile.MemProfile).Stop()
 	rand.Seed(0)
 
 	cluster := []goraft.ClusterMember{
@@ -130,7 +130,7 @@ outer:
 	}
 
 	N_CLIENTS := 1
-	N_ENTRIES := 100_000 / N_CLIENTS
+	N_ENTRIES := 8_000 / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
@@ -182,7 +182,7 @@ outer:
 								len(entries),
 								i+1,
 								N_ENTRIES,
-								(i+1)/N_ENTRIES,
+								((i+1) * 100)/N_ENTRIES,
 								diff,
 								float64(len(entries)) / float64(diff / time.Second),
 							)
