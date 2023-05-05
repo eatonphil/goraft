@@ -12,8 +12,8 @@ import (
 	"net/rpc"
 	"os"
 	"path"
-	//"sync"
-	sync "github.com/sasha-s/go-deadlock"
+	"sync"
+	//sync "github.com/sasha-s/go-deadlock"
 	"time"
 )
 
@@ -27,15 +27,15 @@ type StateMachine interface {
 	Apply(cmd []byte) ([]byte, error)
 }
 
-type applyResult struct {
-	res []byte
-	err error
+type ApplyResult struct {
+	Result []byte
+	Error  error
 }
 
 type Entry struct {
 	Command []byte
 	Term    uint64
-	result  chan applyResult
+	result  chan ApplyResult
 }
 
 type RPCMessage struct {
@@ -233,7 +233,7 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
+	//sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
@@ -260,7 +260,7 @@ func NewServer(
 
 const PAGE_SIZE = 4096
 const ENTRY_HEADER = 16
-const ENTRY_SIZE = PAGE_SIZE
+const ENTRY_SIZE = 256
 
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
@@ -277,7 +277,6 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 	s.fd.Seek(0, 0)
 
 	var page [PAGE_SIZE]byte
-	bw := bufio.NewWriter(s.fd)
 	// Bytes 0  - 8:   Current term
 	// Bytes 8  - 16:  Voted for
 	// Bytes 16 - 24:  Log length
@@ -293,10 +292,10 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 	Server_assert(s, "Wrote full page", n, PAGE_SIZE)
 
 	if writeLog && nNewEntries > 0 {
-
 		newLogOffset := max(len(s.log)-nNewEntries, 0)
 
 		s.fd.Seek(int64(PAGE_SIZE+ENTRY_SIZE*newLogOffset), 0)
+		bw := bufio.NewWriter(s.fd)
 
 		var entryBytes [ENTRY_SIZE]byte
 		for i := newLogOffset; i < len(s.log); i++ {
@@ -312,16 +311,17 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 			binary.LittleEndian.PutUint64(entryBytes[8:16], uint64(len(s.log[i].Command)))
 			copy(entryBytes[16:], []byte(s.log[i].Command))
 
-			n, err := s.fd.Write(entryBytes[:])
+			n, err := bw.Write(entryBytes[:])
 			if err != nil {
 				panic(err)
 			}
 			Server_assert(s, "Wrote full page", n, ENTRY_SIZE)
 		}
-	}
 
-	if err = bw.Flush(); err != nil {
-		panic(err)
+		err = bw.Flush()
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	if err = s.fd.Sync(); err != nil {
@@ -583,7 +583,9 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 var ErrApplyToLeader = errors.New("Cannot apply message to follower, apply to leader.")
 
-func (s *Server) Apply(command []byte) ([]byte, error) {
+var lastApply = time.Now()
+
+func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	s.mu.Lock()
 	if s.state != leaderState {
 		s.mu.Unlock()
@@ -591,21 +593,45 @@ func (s *Server) Apply(command []byte) ([]byte, error) {
 	}
 	s.debug("Processing new entry!")
 
-	resultChan := make(chan applyResult)
-	s.log = append(s.log, Entry{
-		Term:    s.currentTerm,
-		Command: command,
-		result:  resultChan,
-	})
+	resultChans := make([]chan ApplyResult, len(commands))
+	for i, command := range commands {
+		resultChans[i] = make(chan ApplyResult)
+		s.log = append(s.log, Entry{
+			Term:    s.currentTerm,
+			Command: command,
+			result:  resultChans[i],
+		})
+	}
 	s.mu.Unlock()
 	s.persist(true, 1)
 
-	s.appendEntries()
+	go func () {
+		delay := 3*time.Millisecond
+		time.Sleep(delay)
+		s.mu.Lock()
+		if time.Now().Sub(lastApply) > delay {
+			s.appendEntries()
+			lastApply = time.Now()
+		}
+		s.mu.Unlock()
+	}()
 
 	// TODO: What happens if this takes too long?
 	s.debug("Waiting to be applied!")
-	result := <-resultChan
-	return result.res, result.err
+
+	results := make([]ApplyResult, len(commands))
+	var wg sync.WaitGroup
+	wg.Add(len(commands))
+	for i, ch := range resultChans {
+		go func(i int, c chan ApplyResult) {
+			results[i] = <-c
+			wg.Done()
+		}(i, ch)
+	}
+
+	wg.Wait()
+
+	return results, nil
 }
 
 func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
@@ -630,6 +656,8 @@ func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
 	return err == nil
 }
 
+const MAX_APPEND_ENTRIES_BATCH = 8_000
+
 func (s *Server) appendEntries() {
 	for i := range s.cluster {
 		// Don't need to send message to self
@@ -651,8 +679,8 @@ func (s *Server) appendEntries() {
 			}
 
 			// Keep latency down by only applying N at a time.
-			if len(entries) > 50 {
-				entries = entries[:50]
+			if len(entries) > MAX_APPEND_ENTRIES_BATCH {
+				entries = entries[:MAX_APPEND_ENTRIES_BATCH]
 			}
 
 			lenEntries := uint64(len(entries))
@@ -748,9 +776,9 @@ func (s *Server) advanceCommitIndex() {
 			// Will be nil for follower entries and for no-op entries.
 			// Not nil for all user submitted messages.
 			if log.result != nil {
-				log.result <- applyResult{
-					res: res,
-					err: err,
+				log.result <- ApplyResult{
+					Result: res,
+					Error:  err,
 				}
 			}
 		}
@@ -884,9 +912,18 @@ func (s *Server) IsLeader() bool {
 	return s.state == leaderState
 }
 
-func (s *Server) Entries() int {
+// Excludes heartbeat entries
+func (s *Server) AllCommitted() bool {
 	s.mu.Lock()
-	e := len(s.log)
-	s.mu.Unlock()
-	return e
+	defer s.mu.Unlock()
+
+	for i := len(s.log)-1; i >= 0; i-- {
+		e := s.log[i]
+		// Last entry in the log that is applied by the user.
+		if len(e.Command) > 0 {
+			return s.lastApplied >= uint64(i)
+		}
+	}
+
+	return true
 }

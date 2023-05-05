@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/eatonphil/goraft"
+	// "github.com/pkg/profile"
 )
 
 type kvStateMachine struct {
@@ -82,6 +83,7 @@ func randomString() string {
 }
 
 func main() {
+	//defer profile.Start(profile.MemProfile).Stop()
 	rand.Seed(0)
 
 	cluster := []goraft.ClusterMember{
@@ -127,67 +129,101 @@ outer:
 		time.Sleep(time.Second)
 	}
 
-	N_ENTRIES := 3_000
+	N_CLIENTS := 1
+	N_ENTRIES := 8_000 / N_CLIENTS
+	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
+	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
+	var wg sync.WaitGroup
+	wg.Add(N_CLIENTS)
 	var randKey, randValue string
-	t := time.Now()
 	var total time.Duration
-	for i := 0; i < N_ENTRIES; i++ {
-		if i%1000 == 0 && i > 0 {
-			fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
-			t = time.Now()
-		}
-		key := randomString()
-		value := randomString()
+	var mu sync.Mutex
+	for j := 0; j < N_CLIENTS; j++ {
+		go func(j int) {
+			defer wg.Done()
 
-		if rand.Intn(100) > 90 || i == 0 {
-			randKey = key
-			randValue = value
-		}
+			//t := time.Now()
+			var entries [][]byte
+			for i := 0; i < N_ENTRIES; i++ {
+				// if i%1000 == 0 && i > 0 {
+				// 	fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
+				// 	t = time.Now()
+				// }
+				key := randomString()
+				value := randomString()
 
-	foundALeader:
-		for {
-			for _, s := range []*goraft.Server{s1, s2, s3} {
-				t := time.Now()
-				_, err := s.Apply(kvsmMessage_Set(key, value))
-				total += time.Now().Sub(t)
-				if err == goraft.ErrApplyToLeader {
-					continue
-				} else if err != nil {
-					panic(err)
-				} else {
-					break foundALeader
+				if rand.Intn(100) > 90 || i == 0 && j == 0 {
+					randKey = key
+					randValue = value
 				}
-			}
-			time.Sleep(time.Second)
-		}
 
-		goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
+				entries = append(entries, kvsmMessage_Set(key, value))
+
+				if len(entries) < BATCH_SIZE && i < N_ENTRIES-1 {
+					continue
+				}
+			foundALeader:
+				for {
+					for _, s := range []*goraft.Server{s1, s2, s3} {
+						t := time.Now()
+						_, err := s.Apply(entries)
+						if err == goraft.ErrApplyToLeader {
+							continue
+						} else if err != nil {
+							panic(err)
+						} else {
+							diff := time.Now().Sub(t)
+							mu.Lock()
+							total += diff
+							mu.Unlock()
+							fmt.Printf("Client: %d. %d entries (%d of %d: %d%%) inserted. Latency: %s. Throughput: %f entries/s.\n",
+								j,
+								len(entries),
+								i+1,
+								N_ENTRIES,
+								((i+1) * 100)/N_ENTRIES,
+								diff,
+								float64(len(entries)) / float64(diff / time.Second),
+							)
+							break foundALeader
+						}
+					}
+					time.Sleep(time.Second)
+				}
+
+				entries = [][]byte{}
+			}
+		}(j)
 	}
+
+	wg.Wait()
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/float64(total/time.Second))
 
-	var v []byte
-	var err error
 	for _, s := range []*goraft.Server{s1, s2, s3} {
-		v, err = s.Apply(kvsmMessage_Get(randKey))
+		for !s.AllCommitted() {
+			time.Sleep(time.Second)
+			fmt.Println("Waiting for commits to be applied.")
+		}
+	}
+
+	var v []byte
+	for _, s := range []*goraft.Server{s1, s2, s3} {
+		res, err := s.Apply([][]byte{kvsmMessage_Get(randKey)})
 		if err == goraft.ErrApplyToLeader {
 			continue
 		} else if err != nil {
 			panic(err)
 		} else {
+			v = res[0].Result
 			break
 		}
 	}
-
-	// Ooph, but need to wait for the other state machines to catch up.
-	time.Sleep(2 * time.Second)
 
 	for _, sm := range []*kvStateMachine{sm1, sm2, sm3} {
 		goraft.Assert("Each node state machine is up-to-date", string(v), sm.kv[randKey])
 		goraft.Assert("Each node state machine is up-to-date", randValue, sm.kv[randKey])
 	}
-
-	goraft.Assert("Quorum reached", s1.Entries() == s2.Entries() || s1.Entries() == s3.Entries() || s2.Entries() == s3.Entries(), true)
 
 	fmt.Printf("%s = %s, expected: %s\n", randKey, string(v), randValue)
 }

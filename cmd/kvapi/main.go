@@ -74,7 +74,7 @@ func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = hs.raft.Apply(buf.Bytes())
+	_, err = hs.raft.Apply([][]byte{buf.Bytes()})
 	if err != nil {
 		log.Printf("Could not write key-value: %s", err)
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
@@ -133,9 +133,9 @@ func getConfig() config {
 		if arg == "--cluster" {
 			cluster := os.Args[i+2]
 			var clusterEntry goraft.ClusterMember
-			for _, part := range strings.Split(cluster, ";") {
+			for i, part := range strings.Split(cluster, ";") {
 				idAddress := strings.Split(part, ",")
-				clusterEntry.Id = idAddress[0]
+				clusterEntry.Id = uint64(i)
 				clusterEntry.Address = idAddress[1]
 				cfg.cluster = append(cfg.cluster, clusterEntry)
 			}
