@@ -920,7 +920,7 @@ func (s *Server) AllCommitted() bool {
 }
 
 type EntriesIterator struct {
-	s *Server
+	s     *Server
 	index int
 	Entry Entry
 }
@@ -943,7 +943,7 @@ func (ei *EntriesIterator) Next() bool {
 // Exclude blank entries
 func (s *Server) AllEntries() *EntriesIterator {
 	return &EntriesIterator{
-		s: s,
+		s:     s,
 		index: 0,
 		Entry: Entry{},
 	}
