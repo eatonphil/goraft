@@ -255,6 +255,7 @@ func NewServer(
 		mu:           sync.Mutex{},
 	}
 
+	// Literally just a cheat for benchmarks.
 	s.log = make([]Entry, 0, 1_000_000)
 	s.state = followerState
 	return s
@@ -262,7 +263,7 @@ func NewServer(
 
 const PAGE_SIZE = 4096
 const ENTRY_HEADER = 16
-const ENTRY_SIZE = 4096
+const ENTRY_SIZE = 128
 
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
@@ -560,11 +561,15 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 	nNewEntries := 0
 	for i := next; i < next+uint64(len(req.Entries)); i++ {
 		e := req.Entries[i-next]
-		if i >= uint64(len(s.log)) || s.log[i].Term != e.Term {
-			// Either allocate space for the whole thing, or truncate when terms mismatch.
+		if i >= uint64(len(s.log)) {
 			newLog := make([]Entry, next+uint64(len(req.Entries)))
 			copy(newLog, s.log)
 			s.log = newLog
+		}
+		if s.log[i].Term != e.Term {
+			prevCap := cap(s.log)
+			s.log = s.log[:i]
+			Server_assert(s, "Capacity remains the same while we truncated.", cap(s.log), prevCap)
 		}
 
 		s.log[i] = e

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/eatonphil/goraft"
-	// "github.com/pkg/profile"
+	"github.com/pkg/profile"
 )
 
 type kvStateMachine struct {
@@ -84,7 +84,7 @@ func randomString() string {
 }
 
 func main() {
-	//defer profile.Start(profile.MemProfile).Stop()
+	defer profile.Start(profile.MemProfile).Stop()
 	rand.Seed(0)
 
 	cluster := []goraft.ClusterMember{
