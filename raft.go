@@ -254,13 +254,15 @@ func NewServer(
 		heartbeatMs:  300,
 		mu:           sync.Mutex{},
 	}
+
+	s.log = make([]Entry, 0, 1_000_000)
 	s.state = followerState
 	return s
 }
 
 const PAGE_SIZE = 4096
 const ENTRY_HEADER = 16
-const ENTRY_SIZE = 256
+const ENTRY_SIZE = 4096
 
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
@@ -304,7 +306,7 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 			// Bytes 16 - ENTRY_SIZE: Entry command
 
 			if len(s.log[i].Command) > ENTRY_SIZE-ENTRY_HEADER {
-				panic(fmt.Sprintf("Command is too large. Must be at most %d bytes.", ENTRY_SIZE-ENTRY_HEADER))
+				panic(fmt.Sprintf("Command is too large (%d). Must be at most %d bytes.", len(s.log[i].Command), ENTRY_SIZE-ENTRY_HEADER))
 			}
 
 			binary.LittleEndian.PutUint64(entryBytes[:8], s.log[i].Term)
@@ -333,7 +335,7 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 func (s *Server) initialize() {
 	if len(s.log) == 0 {
 		// Always has at least one log entry.
-		s.log = []Entry{{}}
+		s.log = append(s.log, Entry{})
 	}
 
 	for i := range s.cluster {
@@ -381,7 +383,6 @@ func (s *Server) restore() {
 	if lenLog > 0 {
 		s.fd.Seek(int64(PAGE_SIZE), 0)
 
-		s.log = make([]Entry, lenLog)
 		var e Entry
 		for i := 0; i < len(s.log); i++ {
 			var entryBytes [ENTRY_SIZE]byte
@@ -902,7 +903,7 @@ func (s *Server) IsLeader() bool {
 	return s.state == leaderState
 }
 
-// Excludes heartbeat entries
+// Excludes blank entries
 func (s *Server) AllCommitted() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -916,4 +917,34 @@ func (s *Server) AllCommitted() bool {
 	}
 
 	return true
+}
+
+type EntriesIterator struct {
+	s *Server
+	index int
+	Entry Entry
+}
+
+func (ei *EntriesIterator) Next() bool {
+	ei.s.mu.Lock()
+	defer ei.s.mu.Unlock()
+
+	for ei.index < len(ei.s.log) {
+		ei.Entry = ei.s.log[ei.index]
+		ei.index++
+		if len(ei.Entry.Command) > 0 {
+			break
+		}
+	}
+
+	return ei.index == len(ei.s.log)
+}
+
+// Exclude blank entries
+func (s *Server) AllEntries() *EntriesIterator {
+	return &EntriesIterator{
+		s: s,
+		index: 0,
+		Entry: Entry{},
+	}
 }

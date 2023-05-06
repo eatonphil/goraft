@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -129,8 +130,8 @@ outer:
 		time.Sleep(time.Second)
 	}
 
-	N_CLIENTS := 2
-	N_ENTRIES := 50_000 / N_CLIENTS
+	N_CLIENTS := 1
+	N_ENTRIES := 50_000 // 50_000 // / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
@@ -139,6 +140,8 @@ outer:
 	var randKey, randValue string
 	var total time.Duration
 	var mu sync.Mutex
+
+	var allEntries [][]byte
 	for j := 0; j < N_CLIENTS; j++ {
 		go func(j int) {
 			defer wg.Done()
@@ -163,6 +166,8 @@ outer:
 				if len(entries) < BATCH_SIZE && i < N_ENTRIES-1 {
 					continue
 				}
+
+				allEntries = append(allEntries, entries...)
 			foundALeader:
 				for {
 					for _, s := range []*goraft.Server{s1, s2, s3} {
@@ -200,13 +205,32 @@ outer:
 	wg.Wait()
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/(float64(total)/float64(time.Second)))
 
-	for _, s := range []*goraft.Server{s1, s2, s3} {
+	for i, s := range []*goraft.Server{s1, s2, s3} {
 		for !s.AllCommitted() {
 			time.Sleep(time.Second)
 			fmt.Println("Waiting for commits to be applied.")
 		}
+
+		fmt.Println("Validating all entries.")
+		var allEntriesIndex int
+		it := s.AllEntries()
+		for {
+			done := it.Next()
+			if !bytes.Equal(it.Entry.Command, allEntries[allEntriesIndex]) {
+				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d.\n", cluster[i].Id, allEntriesIndex))
+			}
+			allEntriesIndex++
+			if done {
+				break
+			}
+		}
+
+		if allEntriesIndex != N_ENTRIES {
+			panic(fmt.Sprintf("Server %d. Expected %d entries, got %d.", cluster[i].Id, N_ENTRIES, allEntriesIndex))
+		}
 	}
 
+	fmt.Println("Validating state machine.")
 	var v []byte
 	for _, s := range []*goraft.Server{s1, s2, s3} {
 		res, err := s.Apply([][]byte{kvsmMessage_Get(randKey)})
