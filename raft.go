@@ -605,16 +605,7 @@ func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	s.mu.Unlock()
 	s.persist(true, 1)
 
-	go func () {
-		delay := 3*time.Millisecond
-		time.Sleep(delay)
-		s.mu.Lock()
-		if time.Now().Sub(lastApply) > delay {
-			s.appendEntries()
-			lastApply = time.Now()
-		}
-		s.mu.Unlock()
-	}()
+	s.appendEntries()
 
 	// TODO: What happens if this takes too long?
 	s.debug("Waiting to be applied!")
@@ -884,9 +875,8 @@ func (s *Server) Start() {
 
 	go func() {
 		s.resetElectionTimeout()
-		ticker := time.NewTicker(time.Millisecond)
 
-		for range ticker.C {
+		for {
 			s.mu.Lock()
 			state := s.state
 			s.mu.Unlock()
@@ -917,7 +907,7 @@ func (s *Server) AllCommitted() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i := len(s.log)-1; i >= 0; i-- {
+	for i := len(s.log) - 1; i >= 0; i-- {
 		e := s.log[i]
 		// Last entry in the log that is applied by the user.
 		if len(e.Command) > 0 {

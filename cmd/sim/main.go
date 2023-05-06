@@ -129,8 +129,8 @@ outer:
 		time.Sleep(time.Second)
 	}
 
-	N_CLIENTS := 1
-	N_ENTRIES := 8_000 / N_CLIENTS
+	N_CLIENTS := 2
+	N_ENTRIES := 50_000 / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
@@ -182,9 +182,9 @@ outer:
 								len(entries),
 								i+1,
 								N_ENTRIES,
-								((i+1) * 100)/N_ENTRIES,
+								((i+1)*100)/N_ENTRIES,
 								diff,
-								float64(len(entries)) / float64(diff / time.Second),
+								float64(len(entries))/(float64(diff)/float64(time.Second)),
 							)
 							break foundALeader
 						}
@@ -198,7 +198,7 @@ outer:
 	}
 
 	wg.Wait()
-	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/float64(total/time.Second))
+	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/(float64(total)/float64(time.Second)))
 
 	for _, s := range []*goraft.Server{s1, s2, s3} {
 		for !s.AllCommitted() {
