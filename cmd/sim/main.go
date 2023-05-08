@@ -158,7 +158,8 @@ outer:
 		allEntries = append(allEntries, encodeKvsmMessage_Set(key, value))
 	}
 
-	servers := []*goraft.Server{s1, s2, s3}
+	servers := []*goraft.Server{s1, s2}
+	sms := []*kvStateMachine{sm1, sm2, sm3}
 
 	// allEntries := [][]byte{
 	// 	encodeKvsmMessage_Set("a", "1"),
@@ -227,7 +228,8 @@ outer:
 
 	for j, entry := range allEntries {
 		_, key, value := decodeKvsmMessage_Set(entry)
-		for i, sm := range []*kvStateMachine{sm1, sm2, sm3} {
+		for i := range servers {
+			sm := sms[i]
 			goraft.Assert(fmt.Sprintf("Server %d state machine is up-to-date on entry %d (%s).", cluster[i].Id, j, key), value, sm.kv[key])
 		}
 	}
@@ -236,7 +238,7 @@ outer:
 
 	var v []byte
 	var key, value string
-	for _, s := range []*goraft.Server{s1, s2, s3} {
+	for _, s := range servers {
 		_, key, value = decodeKvsmMessage_Set(allEntries[0])
 		res, err := s.Apply([][]byte{encodeKvsmMessage_Get(key)})
 		if err == goraft.ErrApplyToLeader {
