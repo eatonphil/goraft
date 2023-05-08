@@ -23,7 +23,7 @@ func newKvSM() *kvStateMachine {
 	}
 }
 
-func kvsmMessage_Get(key string) []byte {
+func encodeKvsmMessage_Get(key string) []byte {
 	msg := make([]byte,
 		3+ // Message type
 			8+ // Key length
@@ -36,7 +36,19 @@ func kvsmMessage_Get(key string) []byte {
 	return msg
 }
 
-func kvsmMessage_Set(key, value string) []byte {
+func decodeKvsmMessage_Get(msg []byte) (bool, string) {
+	msgType := msg[:3]
+	if !bytes.Equal(msgType, []byte("get")) {
+		return false, ""
+	}
+
+	keyLen := binary.LittleEndian.Uint64(msg[3:11])
+	key := string(msg[19 : 19+keyLen])
+
+	return true, key
+}
+
+func encodeKvsmMessage_Set(key, value string) []byte {
 	msg := make([]byte,
 		3+ // Message type
 			8+ // Key length
@@ -52,35 +64,33 @@ func kvsmMessage_Set(key, value string) []byte {
 	return msg
 }
 
-func (kvsm *kvStateMachine) Apply(msg []byte) ([]byte, error) {
+func decodeKvsmMessage_Set(msg []byte) (bool, string, string) {
 	msgType := msg[:3]
+	if !bytes.Equal(msgType, []byte("set")) {
+		return false, "", ""
+	}
+
 	keyLen := binary.LittleEndian.Uint64(msg[3:11])
 	key := string(msg[19 : 19+keyLen])
 
-	var res []byte
+	valLen := binary.LittleEndian.Uint64(msg[11:19])
+	val := string(msg[19+keyLen : 19+keyLen+valLen])
 
-	kvsm.mu.Lock()
-	switch string(msgType) {
-	case "set":
-		valLen := binary.LittleEndian.Uint64(msg[11:19])
-		val := string(msg[19+keyLen : 19+keyLen+valLen])
-		kvsm.kv[key] = val
-	case "get":
-		res = []byte(kvsm.kv[key])
-	}
-	kvsm.mu.Unlock()
-
-	return res, nil
+	return true, key, val
 }
 
-var letters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+func (kvsm *kvStateMachine) Apply(msg []byte) ([]byte, error) {
+	kvsm.mu.Lock()
+	defer kvsm.mu.Unlock()
 
-func randomString() string {
-	b := make([]byte, 16)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
+	if ok, key, val := decodeKvsmMessage_Set(msg); ok {
+		kvsm.kv[key] = val
+		return nil, nil
+	} else if ok, key := decodeKvsmMessage_Get(msg); ok {
+		return []byte(kvsm.kv[key]), nil
+	} else {
+		return nil, fmt.Errorf("Unknown state machine message: %x", msg)
 	}
-	return string(b)
 }
 
 func main() {
@@ -137,42 +147,50 @@ outer:
 
 	var wg sync.WaitGroup
 	wg.Add(N_CLIENTS)
-	var randKey, randValue string
 	var total time.Duration
 	var mu sync.Mutex
 
 	var allEntries [][]byte
+	for i := 0; i < N_ENTRIES; i++ {
+		key := randomString()
+		value := randomString()
+
+		allEntries = append(allEntries, encodeKvsmMessage_Set(key, value))
+	}
+
+	servers := []*goraft.Server{s1, s2, s3}
+
+	// allEntries := [][]byte{
+	// 	encodeKvsmMessage_Set("a", "1"),
+	// 	encodeKvsmMessage_Set("b", "2"),
+	// 	encodeKvsmMessage_Set("c", "3"),
+	// }
+
+	debugEntry := func(entry []byte) string {
+		if ok, key, val := decodeKvsmMessage_Set(entry); ok {
+			return fmt.Sprintf("Key: %s. Value: %s.", key, val)
+		} else if ok, key := decodeKvsmMessage_Get(entry); ok {
+			return fmt.Sprintf("Key: %s.", key)
+		}
+
+		return "Unknown."
+	}
+
 	for j := 0; j < N_CLIENTS; j++ {
 		go func(j int) {
 			defer wg.Done()
 
-			//t := time.Now()
-			var entries [][]byte
-			for i := 0; i < N_ENTRIES; i++ {
-				// if i%1000 == 0 && i > 0 {
-				// 	fmt.Printf("%d entries inserted in %s.\n", i, time.Now().Sub(t))
-				// 	t = time.Now()
-				// }
-				key := randomString()
-				value := randomString()
-
-				if rand.Intn(100) > 90 || i == 0 && j == 0 {
-					randKey = key
-					randValue = value
+			for i := 0; i < N_ENTRIES; i += BATCH_SIZE {
+				end := i + BATCH_SIZE
+				if end > len(allEntries) {
+					end = len(allEntries)
 				}
-
-				entries = append(entries, kvsmMessage_Set(key, value))
-
-				if len(entries) < BATCH_SIZE && i < N_ENTRIES-1 {
-					continue
-				}
-
-				allEntries = append(allEntries, entries...)
+				batch := allEntries[i:end]
 			foundALeader:
 				for {
 					for _, s := range []*goraft.Server{s1, s2, s3} {
 						t := time.Now()
-						_, err := s.Apply(entries)
+						_, err := s.Apply(batch)
 						if err == goraft.ErrApplyToLeader {
 							continue
 						} else if err != nil {
@@ -184,20 +202,19 @@ outer:
 							mu.Unlock()
 							fmt.Printf("Client: %d. %d entries (%d of %d: %d%%) inserted. Latency: %s. Throughput: %f entries/s.\n",
 								j,
-								len(entries),
+								len(batch),
 								i+1,
 								N_ENTRIES,
 								((i+1)*100)/N_ENTRIES,
 								diff,
-								float64(len(entries))/(float64(diff)/float64(time.Second)),
+								float64(len(batch))/(float64(diff)/float64(time.Second)),
 							)
+
 							break foundALeader
 						}
 					}
 					time.Sleep(time.Second)
 				}
-
-				entries = [][]byte{}
 			}
 		}(j)
 	}
@@ -205,35 +222,23 @@ outer:
 	wg.Wait()
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/(float64(total)/float64(time.Second)))
 
-	for i, s := range []*goraft.Server{s1, s2, s3} {
-		for !s.AllCommitted() {
-			time.Sleep(time.Second)
-			fmt.Println("Waiting for commits to be applied.")
-		}
+	validateAllCommitted(servers)
+	validateAllEntries(servers, allEntries, debugEntry)
 
-		fmt.Println("Validating all entries.")
-		var allEntriesIndex int
-		it := s.AllEntries()
-		for {
-			done := it.Next()
-			if !bytes.Equal(it.Entry.Command, allEntries[allEntriesIndex]) {
-				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d.\n", cluster[i].Id, allEntriesIndex))
-			}
-			allEntriesIndex++
-			if done {
-				break
-			}
-		}
-
-		if allEntriesIndex != N_ENTRIES {
-			panic(fmt.Sprintf("Server %d. Expected %d entries, got %d.", cluster[i].Id, N_ENTRIES, allEntriesIndex))
+	for j, entry := range allEntries {
+		_, key, value := decodeKvsmMessage_Set(entry)
+		for i, sm := range []*kvStateMachine{sm1, sm2, sm3} {
+			goraft.Assert(fmt.Sprintf("Server %d state machine is up-to-date on entry %d (%s).", cluster[i].Id, j, key), value, sm.kv[key])
 		}
 	}
 
-	fmt.Println("Validating state machine.")
+	fmt.Println("Validating get.")
+
 	var v []byte
+	var key, value string
 	for _, s := range []*goraft.Server{s1, s2, s3} {
-		res, err := s.Apply([][]byte{kvsmMessage_Get(randKey)})
+		_, key, value = decodeKvsmMessage_Set(allEntries[0])
+		res, err := s.Apply([][]byte{encodeKvsmMessage_Get(key)})
 		if err == goraft.ErrApplyToLeader {
 			continue
 		} else if err != nil {
@@ -244,10 +249,5 @@ outer:
 		}
 	}
 
-	for _, sm := range []*kvStateMachine{sm1, sm2, sm3} {
-		goraft.Assert("Each node state machine is up-to-date", string(v), sm.kv[randKey])
-		goraft.Assert("Each node state machine is up-to-date", randValue, sm.kv[randKey])
-	}
-
-	fmt.Printf("%s = %s, expected: %s\n", randKey, string(v), randValue)
+	fmt.Printf("%s = %s, expected: %s\n", key, string(v), value)
 }

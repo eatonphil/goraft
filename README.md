@@ -17,7 +17,7 @@ Not particularly aggressive yet but does some minimal testing.
 
 ```console
 $ cd cmd/sim
-$ go run main.go
+$ go run main.go util.go
 ```
 
 # Distributed Key-Value Store API

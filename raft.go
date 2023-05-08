@@ -12,8 +12,8 @@ import (
 	"net/rpc"
 	"os"
 	"path"
-	"sync"
-	//sync "github.com/sasha-s/go-deadlock"
+	//"sync"
+	sync "github.com/sasha-s/go-deadlock"
 	"time"
 )
 
@@ -233,7 +233,7 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	//sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
+	sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
@@ -268,10 +268,10 @@ const ENTRY_SIZE = 128
 // Weird thing to note is that writing to a deleted disk is not an
 // error on Linux. So if these files are deleted, you won't know about
 // that until the process restarts.
+//
+// Must be called within s.mu.Lock()
 func (s *Server) persist(writeLog bool, nNewEntries int) {
 	t := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if nNewEntries == 0 && writeLog {
 		nNewEntries = len(s.log)
@@ -442,12 +442,14 @@ func (s *Server) requestVote() {
 				// Will retry later
 				return
 			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
 			if s.updateTerm(rsp.RPCMessage) {
 				return
 			}
 
-			s.mu.Lock()
-			defer s.mu.Unlock()
 			dropStaleResponse := rsp.Term != req.Term && s.state == leaderState
 			if dropStaleResponse {
 				return
@@ -462,9 +464,11 @@ func (s *Server) requestVote() {
 }
 
 func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVoteResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.updateTerm(req.RPCMessage)
 
-	s.mu.Lock()
 	s.debugf("Received vote request from %d.", req.CandidateId)
 
 	rsp.VoteGranted = false
@@ -486,24 +490,18 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 			s.debugf("Voted for %d.", req.CandidateId)
 			s.votedFor = req.CandidateId
 			rsp.VoteGranted = true
+			s.resetElectionTimeout()
+			s.persist(false, 0)
 		} else {
 			s.debugf("Not granting vote request from %d.", +req.CandidateId)
 		}
 	}
 
-	s.mu.Unlock()
-
-	if grant {
-		s.resetElectionTimeout()
-		s.persist(false, 0)
-	}
-
 	return nil
 }
 
+// Must be called within a s.mu.Lock()
 func (s *Server) updateTerm(msg RPCMessage) bool {
-	s.mu.Lock()
-
 	transitioned := false
 	if msg.Term > s.currentTerm {
 		s.currentTerm = msg.Term
@@ -511,10 +509,6 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 		s.votedFor = 0
 		transitioned = true
 		s.debug("Transitioned to follower")
-	}
-	s.mu.Unlock()
-
-	if transitioned {
 		s.resetElectionTimeout()
 		s.persist(false, 0)
 	}
@@ -522,9 +516,10 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 }
 
 func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
-	s.updateTerm(req.RPCMessage)
-
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.updateTerm(req.RPCMessage)
 
 	if req.Term == s.currentTerm && s.state == candidateState {
 		s.state = followerState
@@ -535,17 +530,12 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 	if req.Term < s.currentTerm {
 		s.debugf("Dropping request from old leader %d: term %d.", req.LeaderId, req.Term)
-		s.mu.Unlock()
 		// Not a valid leader.
 		return nil
 	}
 
-	s.mu.Unlock()
-
 	// Valid leader so reset election.
 	s.resetElectionTimeout()
-
-	s.mu.Lock()
 
 	logLen := uint64(len(s.log))
 	validPreviousLog := req.PrevLogIndex == 0 /* This is the induction step */ ||
@@ -553,26 +543,41 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 			s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
 	if !validPreviousLog {
 		s.debug("Not a valid log.")
-		s.mu.Unlock()
 		return nil
 	}
 
 	next := req.PrevLogIndex + 1
 	nNewEntries := 0
+
 	for i := next; i < next+uint64(len(req.Entries)); i++ {
 		e := req.Entries[i-next]
-		if i >= uint64(len(s.log)) {
-			newLog := make([]Entry, next+uint64(len(req.Entries)))
+		if i >= uint64(cap(s.log)) {
+			newTotal := next + uint64(len(req.Entries))
+			// Second argument must actually be `i`
+			// not `0` otherwise the copy after this
+			// doesn't work.
+			// Only copy until `i`, not `newTotal` since
+			// we'll continue appending after this.
+			newLog := make([]Entry, i, newTotal*2)
 			copy(newLog, s.log)
 			s.log = newLog
 		}
-		if s.log[i].Term != e.Term {
+
+		if i < uint64(len(s.log)) && s.log[i].Term != e.Term {
 			prevCap := cap(s.log)
 			s.log = s.log[:i]
 			Server_assert(s, "Capacity remains the same while we truncated.", cap(s.log), prevCap)
 		}
 
-		s.log[i] = e
+		s.debugf("Appending entry: %s. At index: %d.", string(e.Command), len(s.log))
+
+		if i < uint64(len(s.log)) {
+			s.log[i] = e
+		} else {
+			s.log = append(s.log, e)
+			Server_assert(s, "Length is directly related to the index.", uint64(len(s.log)), i+1)
+		}
+
 		nNewEntries++
 	}
 
@@ -580,7 +585,6 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
 	}
 
-	s.mu.Unlock()
 	s.persist(nNewEntries != 0, nNewEntries)
 
 	rsp.Success = true
@@ -597,7 +601,7 @@ func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 		s.mu.Unlock()
 		return nil, ErrApplyToLeader
 	}
-	s.debug("Processing new entry!")
+	s.debugf("Processing %d new entry!", len(commands))
 
 	resultChans := make([]chan ApplyResult, len(commands))
 	for i, command := range commands {
@@ -608,8 +612,9 @@ func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 			result:  resultChans[i],
 		})
 	}
+
+	s.persist(true, len(commands))
 	s.mu.Unlock()
-	s.persist(true, 1)
 
 	s.appendEntries()
 
@@ -702,12 +707,12 @@ func (s *Server) appendEntries() {
 				return
 			}
 
+			s.mu.Lock()
+			defer s.mu.Unlock()
 			if s.updateTerm(rsp.RPCMessage) {
 				return
 			}
 
-			s.mu.Lock()
-			defer s.mu.Unlock()
 			dropStaleResponse := rsp.Term != req.Term && s.state == leaderState
 			if dropStaleResponse {
 				return
@@ -742,7 +747,8 @@ func (s *Server) advanceCommitIndex() {
 					break
 				}
 
-				if s.cluster[j].matchIndex >= i {
+				isLeader := j == s.clusterIndex
+				if s.cluster[j].matchIndex >= i || isLeader {
 					quorum--
 				}
 			}
@@ -756,12 +762,6 @@ func (s *Server) advanceCommitIndex() {
 	}
 
 	if s.lastApplied <= s.commitIndex {
-		if s.lastApplied == 0 {
-			// First entry is always a blank one.
-			s.lastApplied++
-			return
-		}
-
 		log := s.log[s.lastApplied]
 
 		// Command == nil is a noop committed by the leader.
@@ -785,9 +785,6 @@ func (s *Server) advanceCommitIndex() {
 }
 
 func (s *Server) resetElectionTimeout() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
 	s.debugf("New interval: %s.", interval*time.Millisecond)
 	s.electionTimeout = time.Now().Add(interval * time.Millisecond)
@@ -795,6 +792,7 @@ func (s *Server) resetElectionTimeout() {
 
 func (s *Server) timeout() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	hasTimedOut := time.Now().After(s.electionTimeout)
 	if hasTimedOut {
@@ -811,10 +809,7 @@ func (s *Server) timeout() {
 				s.cluster[i].voted = false
 			}
 		}
-	}
-	s.mu.Unlock()
 
-	if hasTimedOut {
 		s.resetElectionTimeout()
 		s.persist(false, 0)
 		s.requestVote()
@@ -823,6 +818,7 @@ func (s *Server) timeout() {
 
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	quorum := len(s.cluster)/2 + 1
 	for i := range s.cluster {
@@ -840,26 +836,18 @@ func (s *Server) becomeLeader() {
 		s.state = leaderState
 		s.heartbeatTimeout = time.Now()
 		s.log = append(s.log, Entry{Term: s.currentTerm, Command: nil})
-	}
-
-	s.mu.Unlock()
-
-	if quorum == 0 {
 		s.persist(true, 1)
 	}
 }
 
 func (s *Server) heartbeat() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	timeForHeartbeat := time.Now().After(s.heartbeatTimeout)
 	if timeForHeartbeat {
 		s.heartbeatTimeout = time.Now().Add(time.Duration(s.heartbeatMs) * time.Millisecond)
-	}
-
-	s.mu.Unlock()
-
-	if timeForHeartbeat {
+		s.debug("Sending heartbeat")
 		s.appendEntries()
 	}
 }
@@ -880,7 +868,9 @@ func (s *Server) Start() {
 	go http.Serve(l, mux)
 
 	go func() {
+		s.mu.Lock()
 		s.resetElectionTimeout()
+		s.mu.Unlock()
 
 		for {
 			s.mu.Lock()
@@ -902,6 +892,10 @@ func (s *Server) Start() {
 	}()
 }
 
+func (s *Server) Id() uint64 {
+	return s.id
+}
+
 func (s *Server) IsLeader() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -909,19 +903,20 @@ func (s *Server) IsLeader() bool {
 }
 
 // Excludes blank entries
-func (s *Server) AllCommitted() bool {
+func (s *Server) AllCommitted() (bool, float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i := len(s.log) - 1; i >= 0; i-- {
+	for i := max(s.commitIndex, 1) - 1; i > 0; i-- {
 		e := s.log[i]
 		// Last entry in the log that is applied by the user.
 		if len(e.Command) > 0 {
-			return s.lastApplied >= uint64(i)
+			return s.lastApplied >= uint64(i), float64(s.lastApplied) / float64(len(s.log)) * 100
 		}
 	}
 
-	return true
+	// Found no user-submitted entries.
+	return true, 100
 }
 
 type EntriesIterator struct {
@@ -937,6 +932,7 @@ func (ei *EntriesIterator) Next() bool {
 	for ei.index < len(ei.s.log) {
 		ei.Entry = ei.s.log[ei.index]
 		ei.index++
+		// Skip ahead until you find the next user-submitted message.
 		if len(ei.Entry.Command) > 0 {
 			break
 		}
