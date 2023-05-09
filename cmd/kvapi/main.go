@@ -4,7 +4,6 @@ import (
 	"bytes"
 	crypto "crypto/rand"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -22,24 +21,72 @@ type statemachine struct {
 	server int
 }
 
-type Command struct {
-	Name string
-	Data map[string]string
+type commandKind uint8
+
+const (
+	setCommand commandKind = iota
+	getCommand
+)
+
+type command struct {
+	kind  commandKind
+	key   string
+	value string
+}
+
+func encodeCommand(c command) []byte {
+	msg := bytes.NewBuffer(nil)
+	err := msg.WriteByte(uint8(c.kind))
+	if err != nil {
+		panic(err)
+	}
+
+	err = binary.Write(msg, binary.LittleEndian, uint64(len(c.key)))
+	if err != nil {
+		panic(err)
+	}
+
+	msg.WriteString(c.key)
+
+	err = binary.Write(msg, binary.LittleEndian, uint64(len(c.value)))
+	if err != nil {
+		panic(err)
+	}
+
+	msg.WriteString(c.value)
+
+	return msg.Bytes()
+}
+
+func decodeCommand(msg []byte) command {
+	var c command
+	c.kind = commandKind(msg[0])
+
+	keyLen := binary.LittleEndian.Uint64(msg[1:9])
+	c.key = string(msg[9 : 9+keyLen])
+
+	if c.kind == setCommand {
+		valLen := binary.LittleEndian.Uint64(msg[9+keyLen : 9+keyLen+8])
+		c.value = string(msg[9+keyLen+8 : 9+keyLen+8+valLen])
+	}
+
+	return c
 }
 
 func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
-	dec := json.NewDecoder(bytes.NewReader(cmd))
-	var c Command
-	err := dec.Decode(&c)
-	if err != nil {
-		return nil, err
-	}
+	c := decodeCommand(cmd)
 
-	switch c.Name {
-	case "set":
-		s.db.Store(c.Data["key"], c.Data["value"])
+	switch c.kind {
+	case setCommand:
+		s.db.Store(c.key, c.value)
+	case getCommand:
+		value, ok := s.db.Load(c.key)
+		if !ok {
+			return nil, fmt.Errorf("Key not found")
+		}
+		return []byte(value.(string)), nil
 	default:
-		return nil, fmt.Errorf("Unknown Command: %s", c.Name)
+		return nil, fmt.Errorf("Unknown command: %x", cmd)
 	}
 
 	return nil, nil
@@ -52,52 +99,72 @@ type httpServer struct {
 
 // Example:
 //
-//	curl http://localhost:2020/set -d '{"key": "x", "value": "1"}' -X POST
+//	curl http://localhost:2020/set?key=x&value=1
 func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	var c Command
-	c.Name = "set"
-	dec := json.NewDecoder(r.Body)
-	err := dec.Decode(&c.Data)
-	if err != nil {
-		log.Printf("Could not read key-value in http request: %s", err)
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
+	var c command
+	c.kind = setCommand
+	c.key = r.URL.Query().Get("key")
+	c.value = r.URL.Query().Get("value")
 
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	err = enc.Encode(c)
-	if err != nil {
-		log.Printf("Could not encode raft Command: %s", err)
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-
-	_, err = hs.raft.Apply([][]byte{buf.Bytes()})
+	_, err := hs.raft.Apply([][]byte{encodeCommand(c)})
 	if err != nil {
 		log.Printf("Could not write key-value: %s", err)
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
-
-	w.WriteHeader(http.StatusOK)
 }
 
+// Example:
+//
+//	curl http://localhost:2020/get?key=x
+//	1
+//	curl http://localhost:2020/get?key=x&relaxed=true # Skips consensus for the read.
+//	1
 func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Query().Get("key")
-	value, _ := hs.db.Load(key)
-	if value == nil {
-		value = ""
+	var c command
+	c.kind = getCommand
+	c.key = r.URL.Query().Get("key")
+
+	var value []byte
+	var err error
+	if r.URL.Query().Get("relaxed") == "true" {
+		v, ok := hs.db.Load(c.key)
+		if !ok {
+			err = fmt.Errorf("Key not found")
+		} else {
+			value = []byte(v.(string))
+		}
+	} else {
+		var results []goraft.ApplyResult
+		results, err = hs.raft.Apply([][]byte{encodeCommand(c)})
+		if err == nil {
+			if len(results) != 1 {
+				err = fmt.Errorf("Expected single response from Raft, got: %d.", len(results))
+			} else if results[0].Error != nil {
+				err = results[0].Error
+			} else {
+				value = results[0].Result
+			}
+
+		}
 	}
 
-	rsp := struct {
-		Data string `json:"data"`
-	}{value.(string)}
-	err := json.NewEncoder(w).Encode(rsp)
 	if err != nil {
 		log.Printf("Could not encode key-value in http response: %s", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	written := 0
+	for written < len(value) {
+		n, err := w.Write(value[written:])
+		if err != nil {
+			log.Printf("Could not encode key-value in http response: %s", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+
+		written += n
 	}
 }
 
@@ -133,9 +200,14 @@ func getConfig() config {
 		if arg == "--cluster" {
 			cluster := os.Args[i+2]
 			var clusterEntry goraft.ClusterMember
-			for i, part := range strings.Split(cluster, ";") {
+			for _, part := range strings.Split(cluster, ";") {
 				idAddress := strings.Split(part, ",")
-				clusterEntry.Id = uint64(i)
+				var err error
+				clusterEntry.Id, err = strconv.ParseUint(idAddress[0], 10, 64)
+				if err != nil {
+					log.Fatal("Expected $id to be a valid integer in `--cluster $id,$ip`, got: %s", idAddress[0])
+				}
+
 				clusterEntry.Address = idAddress[1]
 				cfg.cluster = append(cfg.cluster, clusterEntry)
 			}
@@ -177,7 +249,6 @@ func main() {
 	sm.server = cfg.index
 
 	s := goraft.NewServer(cfg.cluster, &sm, ".", cfg.index)
-	s.Debug = true
 	go s.Start()
 
 	hs := httpServer{s, &db}
