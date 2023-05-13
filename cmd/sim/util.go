@@ -24,6 +24,7 @@ func validateAllCommitted(servers []*goraft.Server) {
 	// heartbeat so that the heartbeat tells all nodes about the
 	// current commitindex.
 	time.Sleep(time.Second)
+	fmt.Printf("Validating all committed for %d servers.\n", len(servers))
 
 	for _, s := range servers {
 		for {
@@ -41,30 +42,55 @@ func validateAllCommitted(servers []*goraft.Server) {
 func validateAllEntries(servers []*goraft.Server, allEntries [][]byte, debug func([]byte) string) {
 	fmt.Println("Validating all entries.")
 	for _, s := range servers {
-		var allEntriesIndex int
-		it := s.AllEntries()
-		for {
-			done := it.Next()
-			if s.Debug {
-				fmt.Printf("Server %d. Entry: %d. %s\n", s.Id(), allEntriesIndex, debug(it.Entry.Command))
+		retries := 3
+	retry:
+		for retries > 0 {
+			if retries < 3 {
+				time.Sleep(30 * time.Second)
+				fmt.Println("Waiting and retrying.")
+			}
+			retries--
+
+			var allEntriesIndex int
+			it := s.AllEntries()
+			for {
+				done := it.Next()
+				if s.Debug {
+					fmt.Printf("Server %d. Entry: %d. %s\n", s.Id(), allEntriesIndex, debug(it.Entry.Command))
+				}
+
+				if allEntriesIndex >= len(allEntries) {
+					fmt.Printf("Server %d. More entries stored than were sent in: %d.\n", s.Id(), allEntriesIndex)
+					continue retry
+				}
+
+				if !bytes.Equal(it.Entry.Command, allEntries[allEntriesIndex]) {
+					fmt.Printf(
+						"Server %d. Missing or out-of-order entry at %d (got: '%s', wanted: %s).\n",
+						s.Id(),
+						allEntriesIndex,
+						string(it.Entry.Command),
+						string(allEntries[allEntriesIndex]),
+					)
+					continue retry
+				}
+
+				allEntriesIndex++
+				if done {
+					break
+				}
 			}
 
-			if allEntriesIndex >= len(allEntries) {
-				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d.\n", s.Id(), allEntriesIndex))
+			if allEntriesIndex != len(allEntries) {
+				fmt.Printf("Server %d. Expected %d entries, got %d.\n", s.Id(), len(allEntries), allEntriesIndex)
+				continue retry
 			}
 
-			if !bytes.Equal(it.Entry.Command, allEntries[allEntriesIndex]) {
-				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d.\n", s.Id(), allEntriesIndex))
-			}
-
-			allEntriesIndex++
-			if done {
-				break
-			}
+			break retry
 		}
 
-		if allEntriesIndex != len(allEntries) {
-			panic(fmt.Sprintf("Server %d. Expected %d entries, got %d.", s.Id(), len(allEntries), allEntriesIndex))
+		if retries == 0 {
+			panic("Failed with too many retries.")
 		}
 	}
 }

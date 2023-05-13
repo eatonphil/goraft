@@ -117,8 +117,11 @@ func main() {
 	sm3 := newKvSM()
 
 	s1 := goraft.NewServer(cluster, sm1, ".", 0)
+	//s1.RPCProxy = goraft.NewSlowRPCProxy(s1)
 	s2 := goraft.NewServer(cluster, sm2, ".", 1)
+	//s2.RPCProxy = goraft.NewSlowRPCProxy(s2)
 	s3 := goraft.NewServer(cluster, sm3, ".", 2)
+	//s3.RPCProxy = goraft.NewSlowRPCProxy(s3)
 
 	DEBUG := false
 	s1.Debug = DEBUG
@@ -158,7 +161,7 @@ outer:
 		allEntries = append(allEntries, encodeKvsmMessage_Set(key, value))
 	}
 
-	servers := []*goraft.Server{s1, s2}
+	servers := []*goraft.Server{s1, s2, s3}
 	sms := []*kvStateMachine{sm1, sm2, sm3}
 
 	// allEntries := [][]byte{

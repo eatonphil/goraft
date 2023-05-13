@@ -99,9 +99,6 @@ type ClusterMember struct {
 
 	votedFor uint64
 	voted    bool
-
-	// TCP connection
-	rpcClient *rpc.Client
 }
 
 type PersistentState struct {
@@ -121,6 +118,12 @@ const (
 	followerState              = "follower"
 	candidateState             = "candidate"
 )
+
+type RPCProxy interface {
+	Start()
+	AppendEntries(int, AppendEntriesRequest, *AppendEntriesResponse) bool
+	RequestVote(int, RequestVoteRequest, *RequestVoteResponse) bool
+}
 
 type Server struct {
 	Debug bool
@@ -178,6 +181,8 @@ type Server struct {
 
 	// Index of this server
 	clusterIndex int
+
+	RPCProxy RPCProxy
 }
 
 func min[T ~int | ~uint64](a, b T) T {
@@ -233,7 +238,7 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
+	//sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
@@ -254,6 +259,7 @@ func NewServer(
 		heartbeatMs:  300,
 		mu:           sync.Mutex{},
 	}
+	s.RPCProxy = NewGoRPCProxy(s)
 
 	// Literally just a cheat for benchmarks.
 	s.log = make([]Entry, 0, 1_000_000)
@@ -417,7 +423,6 @@ func (s *Server) requestVote() {
 
 			// Skip if vote already requested
 			if s.cluster[i].voted {
-				s.mu.Unlock()
 				return
 			}
 			s.debugf("Requesting vote from %d.", s.cluster[i].Id)
@@ -434,10 +439,11 @@ func (s *Server) requestVote() {
 				LastLogIndex: lastLogIndex,
 				LastLogTerm:  lastLogTerm,
 			}
+
 			s.mu.Unlock()
 
 			var rsp RequestVoteResponse
-			ok := s.rpcCall(i, "Server.HandleRequestVoteRequest", req, &rsp)
+			ok := s.RPCProxy.RequestVote(i, req, &rsp)
 			if !ok {
 				// Will retry later
 				return
@@ -636,26 +642,59 @@ func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	return results, nil
 }
 
-func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
-	s.mu.Lock()
-	c := s.cluster[i]
-	var err error
-	var rpcClient *rpc.Client = c.rpcClient
-	if c.rpcClient == nil {
-		c.rpcClient, err = rpc.DialHTTP("tcp", c.Address)
-		rpcClient = c.rpcClient
+type GoRPCProxy struct {
+	s           *Server
+	mu          sync.Mutex
+	connections map[int]*rpc.Client
+}
+
+func NewGoRPCProxy(s *Server) *GoRPCProxy {
+	return &GoRPCProxy{
+		s:           s,
+		mu:          sync.Mutex{},
+		connections: map[int]*rpc.Client{},
 	}
-	s.mu.Unlock()
+}
+
+func (grp *GoRPCProxy) Start() {
+	rpcServer := rpc.NewServer()
+	rpcServer.Register(grp.s)
+	l, err := net.Listen("tcp", grp.s.address)
+	if err != nil {
+		panic(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle(rpc.DefaultRPCPath, rpcServer)
+
+	go http.Serve(l, mux)
+}
+
+func (grp *GoRPCProxy) rpcCall(clusterIndex int, name string, req, rsp any) bool {
+	grp.mu.Lock()
+	conn, ok := grp.connections[clusterIndex]
+	var err error
+	if !ok {
+		conn, err = rpc.DialHTTP("tcp", grp.s.cluster[clusterIndex].Address)
+		// err is handled below
+		grp.connections[clusterIndex] = conn
+	}
+	grp.mu.Unlock()
 
 	if err == nil {
-		err = rpcClient.Call(name, req, rsp)
-	}
-
-	if err != nil {
-		s.warnf("Error calling %s on %d: %s.", name, c.Id, err)
+		err = conn.Call(name, req, rsp)
+	} else {
+		grp.s.warnf("Error calling %s on %d: %s.", name, grp.s.cluster[clusterIndex].Id, err)
 	}
 
 	return err == nil
+}
+
+func (grp *GoRPCProxy) AppendEntries(clusterIndex int, req AppendEntriesRequest, rsp *AppendEntriesResponse) bool {
+	return grp.rpcCall(clusterIndex, "Server.HandleAppendEntriesRequest", req, rsp)
+}
+
+func (grp *GoRPCProxy) RequestVote(clusterIndex int, req RequestVoteRequest, rsp *RequestVoteResponse) bool {
+	return grp.rpcCall(clusterIndex, "Server.HandleRequestVoteRequest", req, rsp)
 }
 
 const MAX_APPEND_ENTRIES_BATCH = 8_000
@@ -697,11 +736,11 @@ func (s *Server) appendEntries() {
 				LeaderCommit: s.commitIndex,
 			}
 
+			s.debugf("Sending %d entries to %d for term %d.", len(entries), s.cluster[i].Id, req.Term)
 			s.mu.Unlock()
 
 			var rsp AppendEntriesResponse
-			s.debugf("Sending %d entries to %d for term %d.", len(entries), s.cluster[i].Id, req.Term)
-			ok := s.rpcCall(i, "Server.HandleAppendEntriesRequest", req, &rsp)
+			ok := s.RPCProxy.AppendEntries(i, req, &rsp)
 			if !ok {
 				// Will retry next tick
 				return
@@ -709,6 +748,7 @@ func (s *Server) appendEntries() {
 
 			s.mu.Lock()
 			defer s.mu.Unlock()
+
 			if s.updateTerm(rsp.RPCMessage) {
 				return
 			}
@@ -856,16 +896,7 @@ func (s *Server) heartbeat() {
 func (s *Server) Start() {
 	s.restore()
 
-	rpcServer := rpc.NewServer()
-	rpcServer.Register(s)
-	l, err := net.Listen("tcp", s.address)
-	if err != nil {
-		panic(err)
-	}
-	mux := http.NewServeMux()
-	mux.Handle(rpc.DefaultRPCPath, rpcServer)
-
-	go http.Serve(l, mux)
+	s.RPCProxy.Start()
 
 	go func() {
 		s.mu.Lock()
@@ -890,62 +921,4 @@ func (s *Server) Start() {
 			}
 		}
 	}()
-}
-
-func (s *Server) Id() uint64 {
-	return s.id
-}
-
-func (s *Server) IsLeader() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state == leaderState
-}
-
-// Excludes blank entries
-func (s *Server) AllCommitted() (bool, float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for i := max(s.commitIndex, 1) - 1; i > 0; i-- {
-		e := s.log[i]
-		// Last entry in the log that is applied by the user.
-		if len(e.Command) > 0 {
-			return s.lastApplied >= uint64(i), float64(s.lastApplied) / float64(len(s.log)) * 100
-		}
-	}
-
-	// Found no user-submitted entries.
-	return true, 100
-}
-
-type EntriesIterator struct {
-	s     *Server
-	index int
-	Entry Entry
-}
-
-func (ei *EntriesIterator) Next() bool {
-	ei.s.mu.Lock()
-	defer ei.s.mu.Unlock()
-
-	for ei.index < len(ei.s.log) {
-		ei.Entry = ei.s.log[ei.index]
-		ei.index++
-		// Skip ahead until you find the next user-submitted message.
-		if len(ei.Entry.Command) > 0 {
-			break
-		}
-	}
-
-	return ei.index == len(ei.s.log)
-}
-
-// Exclude blank entries
-func (s *Server) AllEntries() *EntriesIterator {
-	return &EntriesIterator{
-		s:     s,
-		index: 0,
-		Entry: Entry{},
-	}
 }
