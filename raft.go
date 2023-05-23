@@ -35,7 +35,10 @@ type ApplyResult struct {
 type Entry struct {
 	Command []byte
 	Term    uint64
-	result  chan ApplyResult
+
+	// Set by the primary so it can learn about the result of
+	// applying this command to the state machine
+	result chan ApplyResult
 }
 
 type RPCMessage struct {
@@ -84,7 +87,8 @@ type AppendEntriesRequest struct {
 type AppendEntriesResponse struct {
 	RPCMessage
 
-	// true if follower contained entry matching prevLogIndex and prevLogTerm
+	// true if follower contained entry matching prevLogIndex and
+	// prevLogTerm
 	Success bool
 }
 
@@ -97,21 +101,11 @@ type ClusterMember struct {
 	// Highest log entry known to be replicated
 	matchIndex uint64
 
+	// Who was voted for in the most recent term
 	votedFor uint64
-	voted    bool
 
 	// TCP connection
 	rpcClient *rpc.Client
-}
-
-type PersistentState struct {
-	// The current term
-	CurrentTerm uint64
-
-	// candidateId that received vote in current term (or null if none)
-	VotedFor uint64
-
-	Log []Entry
 }
 
 type ServerState string
@@ -131,10 +125,10 @@ type Server struct {
 	// The current term
 	currentTerm uint64
 
-	// Who was voted for
-	votedFor uint64
-
 	log []Entry
+
+	// votedFor is stored in `cluster []ClusterMember` below,
+	// mapped by `clusterIndex` below
 
 	// ----------- READONLY STATE -----------
 
@@ -286,7 +280,7 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 	// Bytes 4096 - N: Log
 
 	binary.LittleEndian.PutUint64(page[:8], s.currentTerm)
-	binary.LittleEndian.PutUint64(page[8:16], s.votedFor)
+	binary.LittleEndian.PutUint64(page[8:16], s.getVotedFor())
 	binary.LittleEndian.PutUint64(page[16:24], uint64(len(s.log)))
 	n, err := s.fd.Write(page[:])
 	if err != nil {
@@ -330,7 +324,7 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 	if err = s.fd.Sync(); err != nil {
 		panic(err)
 	}
-	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewEntries, s.votedFor)
+	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewEntries, s.getVotedFor())
 }
 
 func (s *Server) initialize() {
@@ -338,12 +332,30 @@ func (s *Server) initialize() {
 		// Always has at least one log entry.
 		s.log = append(s.log, Entry{})
 	}
+}
 
+// Must be called within s.mu.Lock()
+func (s *Server) setVotedFor(id uint64) {
 	for i := range s.cluster {
 		if i == s.clusterIndex {
-			s.cluster[i].votedFor = s.votedFor
+			s.cluster[i].votedFor = id
+			return
 		}
 	}
+
+	Server_assert(s, "Invalid cluster", true, false)
+}
+
+// Must be called within s.mu.Lock()
+func (s *Server) getVotedFor() uint64 {
+	for i := range s.cluster {
+		if i == s.clusterIndex {
+			return s.cluster[i].votedFor
+		}
+	}
+
+	Server_assert(s, "Invalid cluster", true, false)
+	return 0
 }
 
 func (s *Server) restore() {
@@ -378,7 +390,7 @@ func (s *Server) restore() {
 	Server_assert(s, "Read full page", n, PAGE_SIZE)
 
 	s.currentTerm = binary.LittleEndian.Uint64(page[:8])
-	s.votedFor = binary.LittleEndian.Uint64(page[8:16])
+	s.setVotedFor(binary.LittleEndian.Uint64(page[8:16]))
 	lenLog := binary.LittleEndian.Uint64(page[16:24])
 
 	if lenLog > 0 {
@@ -415,13 +427,7 @@ func (s *Server) requestVote() {
 		go func(i int) {
 			s.mu.Lock()
 
-			// Skip if vote already requested
-			if s.cluster[i].voted {
-				s.mu.Unlock()
-				return
-			}
 			s.debugf("Requesting vote from %d.", s.cluster[i].Id)
-			s.cluster[i].voted = true
 
 			lastLogIndex := uint64(len(s.log) - 1)
 			lastLogTerm := s.log[len(s.log)-1].Term
@@ -474,27 +480,27 @@ func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVo
 	rsp.VoteGranted = false
 	rsp.Term = s.currentTerm
 
-	var grant bool
 	if req.Term < s.currentTerm {
 		s.debugf("Not granting vote request from %d.", req.CandidateId)
 		Server_assert(s, "VoteGranted = false", rsp.VoteGranted, false)
+		return nil
+	}
+
+	lastLogTerm := s.log[len(s.log)-1].Term
+	logLen := uint64(len(s.log) - 1)
+	logOk := req.LastLogTerm > lastLogTerm ||
+		(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
+	grant := req.Term == s.currentTerm &&
+		logOk &&
+		(s.getVotedFor() == 0 || s.getVotedFor() == req.CandidateId)
+	if grant {
+		s.debugf("Voted for %d.", req.CandidateId)
+		s.setVotedFor(req.CandidateId)
+		rsp.VoteGranted = true
+		s.resetElectionTimeout()
+		s.persist(false, 0)
 	} else {
-		lastLogTerm := s.log[len(s.log)-1].Term
-		logLen := uint64(len(s.log) - 1)
-		logOk := req.LastLogTerm > lastLogTerm ||
-			(req.LastLogTerm == lastLogTerm && req.LastLogIndex >= logLen)
-		grant = req.Term == s.currentTerm &&
-			logOk &&
-			(s.votedFor == 0 || s.votedFor == req.CandidateId)
-		if grant {
-			s.debugf("Voted for %d.", req.CandidateId)
-			s.votedFor = req.CandidateId
-			rsp.VoteGranted = true
-			s.resetElectionTimeout()
-			s.persist(false, 0)
-		} else {
-			s.debugf("Not granting vote request from %d.", +req.CandidateId)
-		}
+		s.debugf("Not granting vote request from %d.", +req.CandidateId)
 	}
 
 	return nil
@@ -506,7 +512,7 @@ func (s *Server) updateTerm(msg RPCMessage) bool {
 	if msg.Term > s.currentTerm {
 		s.currentTerm = msg.Term
 		s.state = followerState
-		s.votedFor = 0
+		s.setVotedFor(0)
 		transitioned = true
 		s.debug("Transitioned to follower")
 		s.resetElectionTimeout()
@@ -521,12 +527,19 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 	s.updateTerm(req.RPCMessage)
 
+	// From Candidates (§5.2) in Figure 2
+	// If AppendEntries RPC received from new leader: convert to follower
 	if req.Term == s.currentTerm && s.state == candidateState {
 		s.state = followerState
 	}
 
 	rsp.Term = s.currentTerm
 	rsp.Success = false
+
+	if s.state != followerState {
+		s.debugf("Non-follower cannot append entries.")
+		return nil
+	}
 
 	if req.Term < s.currentTerm {
 		s.debugf("Dropping request from old leader %d: term %d.", req.LeaderId, req.Term)
@@ -565,6 +578,10 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 		if i < uint64(len(s.log)) && s.log[i].Term != e.Term {
 			prevCap := cap(s.log)
+			// If an existing entry conflicts with a new
+			// one (same index but different terms),
+			// delete the existing entry and all that
+			// follow it (§5.3)
 			s.log = s.log[:i]
 			Server_assert(s, "Capacity remains the same while we truncated.", cap(s.log), prevCap)
 		}
@@ -572,13 +589,12 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 		s.debugf("Appending entry: %s. At index: %d.", string(e.Command), len(s.log))
 
 		if i < uint64(len(s.log)) {
-			s.log[i] = e
+			Server_assert(s, "Existing log is the same as new log", s.log[i].Term, e.Term)
 		} else {
 			s.log = append(s.log, e)
 			Server_assert(s, "Length is directly related to the index.", uint64(len(s.log)), i+1)
+			nNewEntries++
 		}
-
-		nNewEntries++
 	}
 
 	if req.LeaderCommit > s.commitIndex {
@@ -593,10 +609,9 @@ func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *Appen
 
 var ErrApplyToLeader = errors.New("Cannot apply message to follower, apply to leader.")
 
-var lastApply = time.Now()
-
 func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	s.mu.Lock()
+
 	if s.state != leaderState {
 		s.mu.Unlock()
 		return nil, ErrApplyToLeader
@@ -614,13 +629,13 @@ func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
 	}
 
 	s.persist(true, len(commands))
+
+	s.debug("Waiting to be applied!")
 	s.mu.Unlock()
 
 	s.appendEntries()
 
 	// TODO: What happens if this takes too long?
-	s.debug("Waiting to be applied!")
-
 	results := make([]ApplyResult, len(commands))
 	var wg sync.WaitGroup
 	wg.Add(len(commands))
@@ -722,7 +737,7 @@ func (s *Server) appendEntries() {
 				prev := s.cluster[i].nextIndex
 				s.cluster[i].nextIndex = max(req.PrevLogIndex+lenEntries+1, 1)
 				s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
-				s.debugf("Message accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
+				s.debugf("Messages (%d) accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.", len(req.Entries), s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
 			} else {
 				s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
 				s.debugf("Forced to go back to %d for: %d.", s.cluster[i].nextIndex, s.cluster[i].Id)
@@ -740,15 +755,15 @@ func (s *Server) advanceCommitIndex() {
 		lastLogIndex := uint64(len(s.log) - 1)
 
 		for i := lastLogIndex; i > s.commitIndex; i-- {
-			// not `len(s.cluster)/2 + 1` since the leader already has the entry.
-			quorum := len(s.cluster) / 2
+			quorum := len(s.cluster)/2 + 1
 			for j := range s.cluster {
 				if quorum == 0 {
 					break
 				}
 
 				isLeader := j == s.clusterIndex
-				if s.cluster[j].matchIndex >= i || isLeader {
+				// Leader always has the log.
+				if isLeader || s.cluster[j].matchIndex >= i {
 					quorum--
 				}
 			}
@@ -784,6 +799,7 @@ func (s *Server) advanceCommitIndex() {
 	}
 }
 
+// Must be called within a s.mu.Lock()
 func (s *Server) resetElectionTimeout() {
 	interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
 	s.debugf("New interval: %s.", interval*time.Millisecond)
@@ -799,14 +815,11 @@ func (s *Server) timeout() {
 		s.debug("Timed out, starting new election.")
 		s.state = candidateState
 		s.currentTerm++
-		s.votedFor = s.id
 		for i := range s.cluster {
 			if i == s.clusterIndex {
 				s.cluster[i].votedFor = s.id
-				s.cluster[i].voted = true
 			} else {
 				s.cluster[i].votedFor = 0
-				s.cluster[i].voted = false
 			}
 		}
 
@@ -822,21 +835,39 @@ func (s *Server) becomeLeader() {
 
 	quorum := len(s.cluster)/2 + 1
 	for i := range s.cluster {
-		// Reset all other state while we're at it
-		s.cluster[i].nextIndex = uint64(len(s.log) + 1)
-		s.cluster[i].matchIndex = 0
-
 		if s.cluster[i].votedFor == s.id && quorum > 0 {
 			quorum--
 		}
 	}
 
 	if quorum == 0 {
+		// Reset all cluster state
+		for i := range s.cluster {
+			s.cluster[i].nextIndex = uint64(len(s.log) + 1)
+			// Yes, even matchIndex is reset. Figure 2
+			// from Raft shows both nextIndex and
+			// matchIndex are reset after every election.
+			s.cluster[i].matchIndex = 0
+		}
+
 		s.debug("New leader.")
 		s.state = leaderState
-		s.heartbeatTimeout = time.Now()
+
+		// From Section 8 Client Interaction:
+		// > First, a leader must have the latest information on
+		// > which entries are committed. The Leader
+		// > Completeness Property guarantees that a leader has
+		// > all committed entries, but at the start of its
+		// > term, it may not know which those are. To find out,
+		// > it needs to commit an entry from its term. Raft
+		// > handles this by having each leader commit a blank
+		// > no-op entry into the log at the start of its term.
 		s.log = append(s.log, Entry{Term: s.currentTerm, Command: nil})
 		s.persist(true, 1)
+
+		// Triggers s.appendEntries() in the next tick of the
+		// main state loop.
+		s.heartbeatTimeout = time.Now()
 	}
 }
 

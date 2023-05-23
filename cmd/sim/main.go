@@ -19,7 +19,7 @@ type kvStateMachine struct {
 
 func newKvSM() *kvStateMachine {
 	return &kvStateMachine{
-		kv: map[string]string{},
+		kv: make(map[string]string, 1_000_000),
 	}
 }
 
@@ -94,7 +94,8 @@ func (kvsm *kvStateMachine) Apply(msg []byte) ([]byte, error) {
 }
 
 func main() {
-	defer profile.Start(profile.MemProfile).Stop()
+	//defer profile.Start(profile.MemProfile).Stop()
+	defer profile.Start().Stop()
 	rand.Seed(0)
 
 	cluster := []goraft.ClusterMember{
@@ -121,16 +122,17 @@ func main() {
 	s3 := goraft.NewServer(cluster, sm3, ".", 2)
 
 	DEBUG := false
-	s1.Debug = DEBUG
-	s1.Start()
-	s2.Debug = DEBUG
-	s2.Start()
-	s3.Debug = DEBUG
-	s3.Start()
+
+	servers := []*goraft.Server{s1, s2, s3}
+	for _, s := range servers {
+		s.Debug = DEBUG
+		s.Start()
+	}
+	sms := []*kvStateMachine{sm1, sm2, sm3}[:len(servers)]
 
 outer:
 	for {
-		for _, s := range []*goraft.Server{s1, s2, s3} {
+		for _, s := range servers {
 			if s.IsLeader() {
 				break outer
 			}
@@ -157,9 +159,6 @@ outer:
 
 		allEntries = append(allEntries, encodeKvsmMessage_Set(key, value))
 	}
-
-	servers := []*goraft.Server{s1, s2}
-	sms := []*kvStateMachine{sm1, sm2, sm3}
 
 	// allEntries := [][]byte{
 	// 	encodeKvsmMessage_Set("a", "1"),
@@ -189,7 +188,7 @@ outer:
 				batch := allEntries[i:end]
 			foundALeader:
 				for {
-					for _, s := range []*goraft.Server{s1, s2, s3} {
+					for _, s := range servers {
 						t := time.Now()
 						_, err := s.Apply(batch)
 						if err == goraft.ErrApplyToLeader {
