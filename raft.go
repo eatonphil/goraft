@@ -456,7 +456,7 @@ func (s *Server) requestVote() {
 				return
 			}
 
-			dropStaleResponse := rsp.Term != req.Term && s.state == leaderState
+			dropStaleResponse := rsp.Term != req.Term
 			if dropStaleResponse {
 				return
 			}
