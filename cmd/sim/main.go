@@ -147,7 +147,7 @@ outer:
 	N_CLIENTS := 1
 	N_ENTRIES := 50_000 // / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
-	TIME_BETWEEN_INSERTS :=  time.Duration(0) //15 * time.Second
+	TIME_BETWEEN_INSERTS := time.Duration(0) //15 * time.Second
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
 	var wg sync.WaitGroup
