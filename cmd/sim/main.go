@@ -19,7 +19,7 @@ type kvStateMachine struct {
 
 func newKvSM() *kvStateMachine {
 	return &kvStateMachine{
-		kv: map[string]string{},
+		kv: make(map[string]string, 0),
 	}
 }
 
@@ -94,7 +94,8 @@ func (kvsm *kvStateMachine) Apply(msg []byte) ([]byte, error) {
 }
 
 func main() {
-	defer profile.Start(profile.MemProfile).Stop()
+	//defer profile.Start(profile.MemProfile).Stop()
+	defer profile.Start().Stop()
 	rand.Seed(0)
 
 	cluster := []goraft.ClusterMember{
@@ -121,17 +122,20 @@ func main() {
 	s3 := goraft.NewServer(cluster, sm3, ".", 2)
 
 	DEBUG := false
-	s1.Debug = DEBUG
-	s1.Start()
-	s2.Debug = DEBUG
-	s2.Start()
-	s3.Debug = DEBUG
-	s3.Start()
 
+	servers := []*goraft.Server{s1, s2, s3}
+	for _, s := range servers {
+		s.Debug = DEBUG
+		s.Start()
+	}
+	sms := []*kvStateMachine{sm1, sm2, sm3}[:len(servers)]
+
+	leader := uint64(0)
 outer:
 	for {
-		for _, s := range []*goraft.Server{s1, s2, s3} {
+		for _, s := range servers {
 			if s.IsLeader() {
+				leader = s.Id()
 				break outer
 			}
 		}
@@ -141,8 +145,9 @@ outer:
 	}
 
 	N_CLIENTS := 1
-	N_ENTRIES := 50_000 // 50_000 // / N_CLIENTS
+	N_ENTRIES := 50_000 // / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
+	TIME_BETWEEN_INSERTS :=  time.Duration(0) //15 * time.Second
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
 	var wg sync.WaitGroup
@@ -157,9 +162,6 @@ outer:
 
 		allEntries = append(allEntries, encodeKvsmMessage_Set(key, value))
 	}
-
-	servers := []*goraft.Server{s1, s2}
-	sms := []*kvStateMachine{sm1, sm2, sm3}
 
 	// allEntries := [][]byte{
 	// 	encodeKvsmMessage_Set("a", "1"),
@@ -182,6 +184,10 @@ outer:
 			defer wg.Done()
 
 			for i := 0; i < N_ENTRIES; i += BATCH_SIZE {
+				if TIME_BETWEEN_INSERTS != 0 {
+					fmt.Println("Injecting latency between client requests.", TIME_BETWEEN_INSERTS)
+					time.Sleep(TIME_BETWEEN_INSERTS)
+				}
 				end := i + BATCH_SIZE
 				if end > len(allEntries) {
 					end = len(allEntries)
@@ -189,7 +195,7 @@ outer:
 				batch := allEntries[i:end]
 			foundALeader:
 				for {
-					for _, s := range []*goraft.Server{s1, s2, s3} {
+					for _, s := range servers {
 						t := time.Now()
 						_, err := s.Apply(batch)
 						if err == goraft.ErrApplyToLeader {
@@ -197,6 +203,7 @@ outer:
 						} else if err != nil {
 							panic(err)
 						} else {
+							goraft.Assert("Leader stayed the same", s.Id(), leader)
 							diff := time.Now().Sub(t)
 							mu.Lock()
 							total += diff
@@ -246,6 +253,7 @@ outer:
 		} else if err != nil {
 			panic(err)
 		} else {
+			goraft.Assert("Leader stayed the same", s.Id(), leader)
 			v = res[0].Result
 			break
 		}
