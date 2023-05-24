@@ -19,7 +19,7 @@ type kvStateMachine struct {
 
 func newKvSM() *kvStateMachine {
 	return &kvStateMachine{
-		kv: make(map[string]string, 1_000_000),
+		kv: make(map[string]string, 0),
 	}
 }
 
@@ -130,10 +130,12 @@ func main() {
 	}
 	sms := []*kvStateMachine{sm1, sm2, sm3}[:len(servers)]
 
+	leader := uint64(0)
 outer:
 	for {
 		for _, s := range servers {
 			if s.IsLeader() {
+				leader = s.Id()
 				break outer
 			}
 		}
@@ -143,8 +145,9 @@ outer:
 	}
 
 	N_CLIENTS := 1
-	N_ENTRIES := 50_000 // 50_000 // / N_CLIENTS
+	N_ENTRIES := 50_000 // / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
+	TIME_BETWEEN_INSERTS :=  time.Duration(0) //15 * time.Second
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
 
 	var wg sync.WaitGroup
@@ -181,6 +184,10 @@ outer:
 			defer wg.Done()
 
 			for i := 0; i < N_ENTRIES; i += BATCH_SIZE {
+				if TIME_BETWEEN_INSERTS != 0 {
+					fmt.Println("Injecting latency between client requests.", TIME_BETWEEN_INSERTS)
+					time.Sleep(TIME_BETWEEN_INSERTS)
+				}
 				end := i + BATCH_SIZE
 				if end > len(allEntries) {
 					end = len(allEntries)
@@ -196,6 +203,7 @@ outer:
 						} else if err != nil {
 							panic(err)
 						} else {
+							goraft.Assert("Leader stayed the same", s.Id(), leader)
 							diff := time.Now().Sub(t)
 							mu.Lock()
 							total += diff
@@ -245,6 +253,7 @@ outer:
 		} else if err != nil {
 			panic(err)
 		} else {
+			goraft.Assert("Leader stayed the same", s.Id(), leader)
 			v = res[0].Result
 			break
 		}

@@ -12,8 +12,8 @@ import (
 	"net/rpc"
 	"os"
 	"path"
-	//"sync"
-	sync "github.com/sasha-s/go-deadlock"
+	"sync"
+	//sync "github.com/sasha-s/go-deadlock"
 	"time"
 )
 
@@ -227,7 +227,7 @@ func NewServer(
 	metadataDir string,
 	clusterIndex int,
 ) *Server {
-	sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
+	//sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
 	// Explicitly make a copy of the cluster because we'll be
 	// modifying it in this server.
 	var cluster []ClusterMember
@@ -249,8 +249,7 @@ func NewServer(
 		mu:           sync.Mutex{},
 	}
 
-	// Literally just a cheat for benchmarks.
-	s.log = make([]Entry, 0, 1_000_000)
+	s.log = make([]Entry, 0, 0)
 	s.state = followerState
 	return s
 }
