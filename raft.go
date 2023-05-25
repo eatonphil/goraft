@@ -357,6 +357,10 @@ func (s *Server) getVotedFor() uint64 {
 	return 0
 }
 
+func (s *Server) Metadata() string {
+	return fmt.Sprintf("md_%d.dat", s.id)
+}
+
 func (s *Server) restore() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -364,7 +368,7 @@ func (s *Server) restore() {
 	if s.fd == nil {
 		var err error
 		s.fd, err = os.OpenFile(
-			path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
+			path.Join(s.metadataDir, s.Metadata()),
 			os.O_SYNC|os.O_CREATE|os.O_RDWR,
 			0755)
 		if err != nil {

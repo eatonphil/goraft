@@ -297,5 +297,35 @@ func main() {
 		append(allEntries, encodeKvsmMessage_Get(testKey)),
 		debugEntry,
 	)
+
+	fmt.Println("Testing deleted log file on one server still recovers entries.")
+	for _, s := range servers {
+		s.Shutdown()
+	}
+
+	servers[0] = goraft.NewServer(cluster, sm1, ".", 0)
+	servers[1] = goraft.NewServer(cluster, sm2, ".", 1)
+	servers[2] = goraft.NewServer(cluster, sm3, ".", 2)
+	os.Remove(servers[2].Metadata())
+	goraft.Assert("Servers are still the same size.", 3, len(servers))
+	for _, s := range servers {
+		s.Start()
+	}
+
+	waitForLeader(servers)
+
+	// TODO: figure out why this is racy.
+	time.Sleep(5 * time.Second)
+
+	validateAllCommitted(servers)
+	validateUserEntries(
+		servers,
+		// Need to also compare against the addition of the
+		// Get message we issued above since Get messages are
+		// also committed to the log.
+		append(allEntries, encodeKvsmMessage_Get(testKey)),
+		debugEntry,
+	)
+
 	fmt.Println("ok")
 }

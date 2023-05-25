@@ -57,16 +57,20 @@ $ ./kvapi --node 2 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
 
 ## Terminal 4
 
+Remember that requests will go through the leader (except for if we
+turn that off in the `/get` request). So you'll have to try sending a
+message to each server until you find the leader.
+
 To set a key:
 
 ```console
-$ curl -v http://localhost:2020/set -d '{"key": "y", "value": "hello"}' -X POST
+$ curl http://localhost:2020/set?key=y&value=hello
 ```
 
 To get a key:
 
 ```console
-$ curl -v http://localhost:2021/get\?key\=y
+$ curl http://localhost:2020/get\?key\=y
 ```
 
 # References

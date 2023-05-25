@@ -45,7 +45,7 @@ func validateUserEntries(servers []*goraft.Server, allEntries [][]byte, debug fu
 		it := s.UserEntries()
 		for {
 			realIndex, done := it.Next()
-			if s.Debug || true {
+			if s.Debug {
 				fmt.Printf("Server %d. Entry: %d. %s\n", s.Id(), allEntriesIndex, debug(it.Entry.Command))
 			}
 
