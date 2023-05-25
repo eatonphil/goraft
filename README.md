@@ -2,6 +2,8 @@
 
 A minimal implementation of Raft in Go. [Demo video](https://www.youtube.com/watch?v=cIR8RoN2LDU).
 
+This blog post [walks through the code](https://notes.eatonphil.com/2023-05-25-raft.html).
+
 NOT FOR PRODUCTION USE.
 
 Things that are missing:
