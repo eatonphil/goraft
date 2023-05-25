@@ -34,11 +34,13 @@ It attempts to do the following:
    aware of.
 4. Validate that all servers have all entries in their log in the
    correct order that entries were inserted.
-5. Shut down all servers.
-6. Turn them back on.
-7. Validate that a leader has been elected.
-8. Validate that all messages that were inserted before shutdown are
+5. Shut down all servers and turn them back on. Validate that a leader has been elected.
+6. Validate that all messages that were inserted before shutdown are
    committed and in the log in the correct order.
+7. Shut down all servers and delete the log for one server.
+8. Turn all servers back on.
+9. Validate that a leader has been elected.
+10. Ensure that all servers have all entries (i.e. that the deleted log has been recovered).
 
 That is: test the basics of leader election and log replication.
 
