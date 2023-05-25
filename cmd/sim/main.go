@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,6 +108,18 @@ func main() {
 	//defer profile.Start(profile.MemProfile).Stop()
 	defer profile.Start().Stop()
 	rand.Seed(0)
+
+	// Delete any existing .dat files
+	entries, err := os.ReadDir("./")
+	if err != nil {
+		panic(err)
+	}
+
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".dat") {
+			os.Remove(e.Name())
+		}
+	}
 
 	cluster := []goraft.ClusterMember{
 		{
