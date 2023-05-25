@@ -19,4 +19,4 @@ jobs:
         check-latest: true
 
     - run: cd cmd/kvapi && go build main.go
-    - run: cd cmd/sim && go run main.go util.go
+    - run: cd cmd/stress && go run main.go util.go

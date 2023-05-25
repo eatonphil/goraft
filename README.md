@@ -11,14 +11,22 @@ Things that are missing:
 * Rigged up to Jepsen
 * Surely much else
 
-## Simulator
+## Stress
 
-Not particularly aggressive yet but does some minimal testing.
+Not particularly aggressive yet but does basic correctness and stress
+testing.
+
+Read more about the details of what it tests [in the
+README](./cmd/stress/README.md).
 
 ```console
-$ cd cmd/sim
+$ cd cmd/stress
 $ go run main.go util.go
 ```
+
+With the `go-deadlock` package turned off and the default `sync`
+package on, I get throughput of around 20k-40k entries/second with
+this stress test.
 
 # Distributed Key-Value Store API
 
