@@ -38,23 +38,24 @@ func validateAllCommitted(servers []*goraft.Server) {
 	}
 }
 
-func validateAllEntries(servers []*goraft.Server, allEntries [][]byte, debug func([]byte) string) {
+func validateUserEntries(servers []*goraft.Server, allEntries [][]byte, debug func([]byte) string) {
 	fmt.Println("Validating all entries.")
 	for _, s := range servers {
-		var allEntriesIndex int
-		it := s.AllEntries()
+		var allEntriesIndex int = 0
+		it := s.UserEntries()
 		for {
-			done := it.Next()
-			if s.Debug {
+			realIndex, done := it.Next()
+			if s.Debug || true {
 				fmt.Printf("Server %d. Entry: %d. %s\n", s.Id(), allEntriesIndex, debug(it.Entry.Command))
 			}
 
 			if allEntriesIndex >= len(allEntries) {
-				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d.\n", s.Id(), allEntriesIndex))
+				panic(fmt.Sprintf("Server %d. Missing entry at %d (log index: %d). (Server log has %d entries.)\n", s.Id(), allEntriesIndex, realIndex, len(s.AllEntries())))
 			}
 
 			if !bytes.Equal(it.Entry.Command, allEntries[allEntriesIndex]) {
-				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d.\n", s.Id(), allEntriesIndex))
+				fmt.Println("Got:", debug(it.Entry.Command), "Wanted:", debug(allEntries[allEntriesIndex]))
+				panic(fmt.Sprintf("Server %d. Missing or out-of-order entry at %d (log index: %d). (Server log has %d entries.)\n", s.Id(), allEntriesIndex, realIndex, len(s.AllEntries())))
 			}
 
 			allEntriesIndex++
@@ -67,4 +68,19 @@ func validateAllEntries(servers []*goraft.Server, allEntries [][]byte, debug fun
 			panic(fmt.Sprintf("Server %d. Expected %d entries, got %d.", s.Id(), len(allEntries), allEntriesIndex))
 		}
 	}
+}
+
+func waitForLeader(servers []*goraft.Server) uint64 {
+	for {
+		for _, s := range servers {
+			if s.IsLeader() {
+				return s.Id()
+			}
+		}
+
+		fmt.Println("Waiting for a leader.")
+		time.Sleep(time.Second)
+	}
+
+	return uint64(0)
 }

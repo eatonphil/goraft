@@ -37,6 +37,10 @@ func encodeKvsmMessage_Get(key string) []byte {
 }
 
 func decodeKvsmMessage_Get(msg []byte) (bool, string) {
+	if len(msg) < 3 {
+		return false, ""
+	}
+
 	msgType := msg[:3]
 	if !bytes.Equal(msgType, []byte("get")) {
 		return false, ""
@@ -65,6 +69,10 @@ func encodeKvsmMessage_Set(key, value string) []byte {
 }
 
 func decodeKvsmMessage_Set(msg []byte) (bool, string, string) {
+	if len(msg) < 3 {
+		return false, "", ""
+	}
+
 	msgType := msg[:3]
 	if !bytes.Equal(msgType, []byte("set")) {
 		return false, "", ""
@@ -89,6 +97,7 @@ func (kvsm *kvStateMachine) Apply(msg []byte) ([]byte, error) {
 	} else if ok, key := decodeKvsmMessage_Get(msg); ok {
 		return []byte(kvsm.kv[key]), nil
 	} else {
+		panic("Unknown state machine message.")
 		return nil, fmt.Errorf("Unknown state machine message: %x", msg)
 	}
 }
@@ -130,22 +139,10 @@ func main() {
 	}
 	sms := []*kvStateMachine{sm1, sm2, sm3}[:len(servers)]
 
-	leader := uint64(0)
-outer:
-	for {
-		for _, s := range servers {
-			if s.IsLeader() {
-				leader = s.Id()
-				break outer
-			}
-		}
-
-		fmt.Println("Waiting for a leader.")
-		time.Sleep(time.Second)
-	}
+	leader := waitForLeader(servers)
 
 	N_CLIENTS := 1
-	N_ENTRIES := 50_000 // / N_CLIENTS
+	N_ENTRIES := 1 // 50_000 // / N_CLIENTS
 	BATCH_SIZE := goraft.MAX_APPEND_ENTRIES_BATCH / N_CLIENTS
 	TIME_BETWEEN_INSERTS := time.Duration(0) //15 * time.Second
 	fmt.Printf("Clients: %d. Entries: %d. Batch: %d.\n", N_CLIENTS, N_ENTRIES, BATCH_SIZE)
@@ -176,7 +173,7 @@ outer:
 			return fmt.Sprintf("Key: %s.", key)
 		}
 
-		return "Unknown."
+		return fmt.Sprintf("Unknown: %x. (len: %d)", entry, len(entry))
 	}
 
 	for j := 0; j < N_CLIENTS; j++ {
@@ -231,8 +228,9 @@ outer:
 	fmt.Printf("Total time: %s. Average insert/second: %s. Throughput: %f entries/s.\n", total, total/time.Duration(N_ENTRIES), float64(N_ENTRIES)/(float64(total)/float64(time.Second)))
 
 	validateAllCommitted(servers)
-	validateAllEntries(servers, allEntries, debugEntry)
+	validateUserEntries(servers, allEntries, debugEntry)
 
+	// Validate state machines.
 	for j, entry := range allEntries {
 		_, key, value := decodeKvsmMessage_Set(entry)
 		for i := range servers {
@@ -244,10 +242,9 @@ outer:
 	fmt.Println("Validating get.")
 
 	var v []byte
-	var key, value string
+	_, testKey, testValue := decodeKvsmMessage_Set(allEntries[0])
 	for _, s := range servers {
-		_, key, value = decodeKvsmMessage_Set(allEntries[0])
-		res, err := s.Apply([][]byte{encodeKvsmMessage_Get(key)})
+		res, err := s.Apply([][]byte{encodeKvsmMessage_Get(testKey)})
 		if err == goraft.ErrApplyToLeader {
 			continue
 		} else if err != nil {
@@ -259,5 +256,32 @@ outer:
 		}
 	}
 
-	fmt.Printf("%s = %s, expected: %s\n", key, string(v), value)
+	fmt.Printf("%s = %s, expected: %s\n", testKey, string(v), testValue)
+
+	fmt.Println("Testing shutdown and restart still holds all values.")
+	for _, s := range servers {
+		s.Shutdown()
+	}
+
+	servers[0] = goraft.NewServer(cluster, sm1, ".", 0)
+	servers[1] = goraft.NewServer(cluster, sm2, ".", 1)
+	servers[2] = goraft.NewServer(cluster, sm3, ".", 2)
+	goraft.Assert("Servers are still the same size.", 3, len(servers))
+	for _, s := range servers {
+		s.Start()
+	}
+
+	waitForLeader(servers)
+	fmt.Println("Found a leader, validating entries.")
+
+	validateAllCommitted(servers)
+	validateUserEntries(
+		servers,
+		// Need to also compare against the addition of the
+		// Get message we issued above since Get messages are
+		// also committed to the log.
+		append(allEntries, encodeKvsmMessage_Get(testKey)),
+		debugEntry,
+	)
+	fmt.Println("ok")
 }

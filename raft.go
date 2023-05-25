@@ -2,6 +2,7 @@ package goraft
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -117,6 +118,10 @@ const (
 )
 
 type Server struct {
+	// These variables for shutting down.
+	done   bool
+	server *http.Server
+
 	Debug bool
 
 	mu sync.Mutex
@@ -238,7 +243,7 @@ func NewServer(
 		cluster = append(cluster, c)
 	}
 
-	s := &Server{
+	return &Server{
 		id:           cluster[clusterIndex].Id,
 		address:      cluster[clusterIndex].Address,
 		cluster:      cluster,
@@ -248,10 +253,6 @@ func NewServer(
 		heartbeatMs:  300,
 		mu:           sync.Mutex{},
 	}
-
-	s.log = make([]Entry, 0, 0)
-	s.state = followerState
-	return s
 }
 
 const PAGE_SIZE = 4096
@@ -326,7 +327,7 @@ func (s *Server) persist(writeLog bool, nNewEntries int) {
 	s.debugf("Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.", time.Now().Sub(t), s.currentTerm, len(s.log), nNewEntries, s.getVotedFor())
 }
 
-func (s *Server) initialize() {
+func (s *Server) ensureLog() {
 	if len(s.log) == 0 {
 		// Always has at least one log entry.
 		s.log = append(s.log, Entry{})
@@ -381,7 +382,7 @@ func (s *Server) restore() {
 	var page [PAGE_SIZE]byte
 	n, err := s.fd.Read(page[:])
 	if err == io.EOF {
-		s.initialize()
+		s.ensureLog()
 		return
 	} else if err != nil {
 		panic(err)
@@ -391,12 +392,13 @@ func (s *Server) restore() {
 	s.currentTerm = binary.LittleEndian.Uint64(page[:8])
 	s.setVotedFor(binary.LittleEndian.Uint64(page[8:16]))
 	lenLog := binary.LittleEndian.Uint64(page[16:24])
+	s.log = nil
 
 	if lenLog > 0 {
 		s.fd.Seek(int64(PAGE_SIZE), 0)
 
 		var e Entry
-		for i := 0; i < len(s.log); i++ {
+		for i := 0; uint64(i) < lenLog; i++ {
 			var entryBytes [ENTRY_SIZE]byte
 			n, err := s.fd.Read(entryBytes[:])
 			if err != nil {
@@ -410,11 +412,11 @@ func (s *Server) restore() {
 			e.Term = binary.LittleEndian.Uint64(entryBytes[:8])
 			lenValue := binary.LittleEndian.Uint64(entryBytes[8:16])
 			e.Command = entryBytes[16 : 16+lenValue]
-			s.log[i] = e
+			s.log = append(s.log, e)
 		}
 	}
 
-	s.initialize()
+	s.ensureLog()
 }
 
 func (s *Server) requestVote() {
@@ -778,8 +780,8 @@ func (s *Server) advanceCommitIndex() {
 	if s.lastApplied <= s.commitIndex {
 		log := s.log[s.lastApplied]
 
-		// Command == nil is a noop committed by the leader.
-		if log.Command != nil {
+		// len(log.Command) == 0 is a noop committed by the leader.
+		if len(log.Command) > 0 {
 			s.debugf("Entry applied: %d.", s.lastApplied)
 			// TODO: what if Apply() takes too long?
 			res, err := s.statemachine.Apply(log.Command)
@@ -884,6 +886,11 @@ func (s *Server) heartbeat() {
 
 // Make sure rand is seeded
 func (s *Server) Start() {
+	s.mu.Lock()
+	s.state = followerState
+	s.done = false
+	s.mu.Unlock()
+
 	s.restore()
 
 	rpcServer := rpc.NewServer()
@@ -895,7 +902,8 @@ func (s *Server) Start() {
 	mux := http.NewServeMux()
 	mux.Handle(rpc.DefaultRPCPath, rpcServer)
 
-	go http.Serve(l, mux)
+	s.server = &http.Server{Handler: mux}
+	go s.server.Serve(l)
 
 	go func() {
 		s.mu.Lock()
@@ -904,6 +912,10 @@ func (s *Server) Start() {
 
 		for {
 			s.mu.Lock()
+			if s.done {
+				s.mu.Unlock()
+				return
+			}
 			state := s.state
 			s.mu.Unlock()
 
@@ -920,6 +932,17 @@ func (s *Server) Start() {
 			}
 		}
 	}()
+}
+
+func (s *Server) Shutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.debug("Shutting down.")
+	s.fd.Close()
+	s.fd = nil
+	s.server.Shutdown(context.Background())
+	s.done = true
 }
 
 func (s *Server) Id() uint64 {
@@ -955,7 +978,7 @@ type EntriesIterator struct {
 	Entry Entry
 }
 
-func (ei *EntriesIterator) Next() bool {
+func (ei *EntriesIterator) Next() (int, bool) {
 	ei.s.mu.Lock()
 	defer ei.s.mu.Unlock()
 
@@ -968,14 +991,30 @@ func (ei *EntriesIterator) Next() bool {
 		}
 	}
 
-	return ei.index == len(ei.s.log)
+	// Can't just compare `ei.index == len(s.log)` because in the
+	// case where there are blank messages in the end of the log
+	// after non-blank messages, Next() wouldn't otherwise know
+	// there is not more. So we peek here.
+	hasMore := false
+	for i := ei.index; i < len(ei.s.log); i++ {
+		if len(ei.s.log[i].Command) > 0 {
+			hasMore = true
+			break
+		}
+	}
+
+	return ei.index, !hasMore
 }
 
 // Exclude blank entries
-func (s *Server) AllEntries() *EntriesIterator {
+func (s *Server) UserEntries() *EntriesIterator {
 	return &EntriesIterator{
 		s:     s,
 		index: 0,
 		Entry: Entry{},
 	}
+}
+
+func (s *Server) AllEntries() []Entry {
+	return s.log
 }
