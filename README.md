@@ -6,6 +6,8 @@ NOT FOR PRODUCTION USE.
 
 Things that are missing:
 
+* Client serial identifier for each message (maybe the most obvious missing function/actual bug)
+  * Search for "session" in [Diego Ongaro's thesis](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf) for more details.
 * Snapshotting/checkpointing and associated state transfer
 * Configuration change protocol
 * Rigged up to Jepsen
@@ -80,7 +82,7 @@ $ curl http://localhost:2020/get\?key\=y
 * Jon Gjengset's [Students' Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/)
 * Jack Vanlightly's [Detecting Bugs in Data Infrastructure using Formal Methods (TLA+ Series Part 1)](https://medium.com/splunk-maas/detecting-bugs-in-data-infrastructure-using-formal-methods-704fde527c58): An intro to TLA+.
 
-Other useful implementations to peer at:
+And useful implementations I looked at for inspiration and clarity.
 
 * Hashicorp's [Raft implementation](https://github.com/hashicorp/raft) in Go: Although it's often quite complicated to learn from since it actually is intended for production.
 * Eli Bendersky's [Raft implementation](https://github.com/eliben/raft) in Go: Although it gets confusing because it uses negative numbers for terms whereas the paper does not.
