@@ -44,19 +44,19 @@ $ rm *.dat
 ## Terminal 1
 
 ```console
-$ ./kvapi --node 1 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
+$ ./kvapi --node 0 --http :2020 --cluster "1,:3031;2,:3032;3,:3033"
 ```
 
 ## Terminal 2
 
 ```console
-$ ./kvapi --node 1 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
+$ ./kvapi --node 1 --http :2021 --cluster "1,:3031;2,:3032;3,:3033"
 ```
 
 ## Terminal 3
 
 ```console
-$ ./kvapi --node 2 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
+$ ./kvapi --node 2 --http :2022 --cluster "1,:3031;2,:3032;3,:3033"
 ```
 
 ## Terminal 4
